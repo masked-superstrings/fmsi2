@@ -1,5 +1,7 @@
 #pragma once
 
+#include <filesystem>
+#include <fstream>
 #include <map>
 #include <random>
 #include <set>
@@ -7,6 +9,7 @@
 #include <vector>
 
 #include "../src/fms_index2.h"
+#include "../src/index_file.h"
 #include "../src/parser.h"
 #include "gtest/gtest.h"
 
@@ -245,6 +248,73 @@ TEST(FMS_INDEX2, HASHES) {
         EXPECT_EQ(hash_of.size(), represented.size());
         EXPECT_EQ(hashes.size(), represented.size());
     }
+}
+
+/// The container of the index files: sections written and read back, stored as they are and compressed, and the
+/// versions that a reader accepts.
+TEST(INDEX_FILE, SECTIONS) {
+    std::mt19937_64 rng(5);
+    const std::string path = testing::TempDir() + "fmsi2_container_test.fmsi";
+    // More than one chunk of compressible content.
+    std::vector<uint8_t> content(3 * fmsi2::file::CHUNK_BYTES + 12345);
+    for (auto &byte : content) byte = rng() % 4;
+    fmsi2::file::metadata meta;
+    meta.set("kind", "test");
+    meta.set("bytes", content.size());
+    const std::string text = meta.text();
+    {
+        fmsi2::file::writer out(path);
+        out.add("META", 1, fmsi2::file::REQUIRED, meta.items().size(), text.data(), text.size());
+        for (bool deflate : {false, true}) {
+            out.add_stream(deflate ? "PACKED" : "RAW", 7, 0, content.size(), content.size(), deflate, 3,
+                           [&](uint64_t begin, uint64_t end, uint8_t *buffer) { memcpy(buffer, content.data() + begin, end - begin); });
+        }
+        out.finish();
+    }
+    {
+        fmsi2::file::reader in(path);
+        ASSERT_EQ(in.meta().get("kind"), "test");
+        ASSERT_EQ(in.meta().number("bytes"), content.size());
+        for (const std::string tag : {"RAW", "PACKED"}) {
+            const fmsi2::file::section_entry &e = in.get(tag);
+            ASSERT_EQ(e.encoding, 7u);
+            ASSERT_EQ(e.raw_bytes, content.size());
+            std::vector<uint8_t> back(content.size(), 0xFF);
+            in.read(e, 2, [&](uint64_t offset, const uint8_t *data, size_t bytes) { memcpy(back.data() + offset, data, bytes); }, true);
+            ASSERT_EQ(back, content);
+        }
+        ASSERT_LT(in.get("PACKED").stored_bytes, in.get("RAW").stored_bytes);
+        ASSERT_EQ(in.find("OTHER"), nullptr);
+        // A reader names the sections it knows: the others must not be required.
+        in.check_known({"META"});
+        ASSERT_THROW(in.check_known({"RAW", "PACKED"}), std::invalid_argument);
+    }
+
+    // The version is in the bytes 8 to 11 of the file: the major number, then the minor one.
+    ASSERT_EQ(fmsi2::file::file_version(path), fmsi2::file::FORMAT_MAJOR);
+    ASSERT_EQ(fmsi2::file::reader(path).version(), "2.0");
+    std::ifstream in(path, std::ios::binary);
+    std::string bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    in.close();
+    auto write = [&](const std::string &changed) {
+        std::ofstream out(path, std::ios::binary);
+        out.write(changed.data(), changed.size());
+    };
+    // A newer minor version is read.
+    bytes[10] = 3;
+    write(bytes);
+    ASSERT_EQ(fmsi2::file::reader(path).version(), "2.3");
+    ASSERT_EQ(fmsi2::file::reader(path).meta().get("kind"), "test");
+    // Another major version is refused; a file of something else is not a file of FMSI 2.
+    bytes[8] = 3;
+    write(bytes);
+    ASSERT_EQ(fmsi2::file::file_version(path), 3u);
+    ASSERT_THROW(fmsi2::file::reader in(path), std::invalid_argument);
+    bytes[0] = 'X';
+    write(bytes);
+    ASSERT_EQ(fmsi2::file::file_version(path), 0u);
+    ASSERT_THROW(fmsi2::file::reader in(path), std::invalid_argument);
+    std::filesystem::remove(path);
 }
 
 /// The packed bytes of a sequence of 2-bit symbols, written and read in pieces.
