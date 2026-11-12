@@ -28,7 +28,7 @@ gzFile OpenFile(std::string &path) {
 
 
 /// Obtain k based on the mask convention of k-1 trailing zeros.
-int infer_k(std::string ms) {
+int infer_k(const std::string &ms) {
     int k = 1;
     while(!is_upper(ms[ms.size() - k])) {
         k++;

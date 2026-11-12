@@ -3,8 +3,9 @@
 [![BioConda Install](https://img.shields.io/conda/dn/bioconda/fmsi.svg?style=flag&label=BioConda%20Install)](https://anaconda.org/bioconda/fmsi)
 [![FMSI test](https://github.com/OndrejSladky/fmsi/actions/workflows/ci.yml/badge.svg)](https://github.com/OndrejSladky/fmsi/actions/)
 
-> **FMSI 2 is in development here.** The program is now `fmsi2`; the rest of this README still describes FMSI 1
-> and calls the program `fmsi`.
+> **FMSI 2 is in development here.** The program is now `fmsi2`: `fmsi2 index`, `fmsi2 query` and `fmsi2 lookup`
+> run the new index, which is one file (`<name>.fmsi`); `fmsi2 <command> -h` lists their options. The commands of
+> FMSI 1, which the rest of this README describes as `fmsi <command>`, are available as `fmsi2 legacy <command>`.
 
 <!-- vim-markdown-toc GFM -->
 

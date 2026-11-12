@@ -2,6 +2,8 @@
 #include <sdsl/suffix_arrays.hpp>
 
 #include "fms_index.h"
+#include "fms_index2.h"
+#include "memory_usage.h"
 #include "parser.h"
 #include "version.h"
 #include "compact.h"
@@ -11,7 +13,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <getopt.h>
 #include <math.h>
+#include <thread>
 
 static int usage() {
   std::cerr << std::endl;
@@ -19,6 +23,21 @@ static int usage() {
   std::cerr << "Version: " << VERSION << std::endl;
   std::cerr << "Contact: Ondrej Sladky (ondra.sladky@gmail.com)" << std::endl << std::endl;
   std::cerr << "Usage:   fmsi2 <command> [options]" << std::endl << std::endl;
+  std::cerr << "Commands:" << std::endl;
+  std::cerr << "    index   - Index a masked superstring: one file <name>.fmsi." << std::endl;
+  std::cerr << "    query   - Membership queries: for every k-mer of the queries, whether it is in the set." << std::endl;
+  std::cerr << "    lookup  - Dictionary queries: the hash of every k-mer of the queries (-1 if it is not in the set)." << std::endl;
+  std::cerr << "    info    - Print what an index file holds." << std::endl << std::endl;
+  std::cerr << "Commands of FMSI 1 (its index of several files; `fmsi2 legacy` lists them):" << std::endl;
+  std::cerr << "    legacy <command> - index, query, lookup, export, and the experimental set operations" << std::endl;
+  std::cerr << "                       (union, inter, diff, symdiff, merge, compact)." << std::endl << std::endl;
+  return 1;
+}
+
+static int usage_legacy() {
+  std::cerr << std::endl;
+  std::cerr << "Usage:   fmsi2 legacy <command> [options]" << std::endl << std::endl;
+  std::cerr << "The commands of FMSI 1, on its index of several files (<prefix>.fmsi.*)." << std::endl << std::endl;
   std::cerr << "Command (stable):" << std::endl;
   std::cerr << "    index   - Creates a BWT based index of the given masked superstring." << std::endl;
   std::cerr << "    query   - Queries k-mers against an index." << std::endl;
@@ -36,7 +55,7 @@ static int usage() {
 
 static int usage_index() {
   std::cerr << std::endl;
-  std::cerr << "Usage:   fmsi2 index [options] <masked-superstring-input>" << std::endl << std::endl;
+  std::cerr << "Usage:   fmsi2 legacy index [options] <masked-superstring-input>" << std::endl << std::endl;
   std::cerr << "Options:" << std::endl;
   std::cerr << "    -k INT  - size of k-mers [recommended, default: number of mask trailing zeros - 1]"
             << std::endl;
@@ -44,13 +63,13 @@ static int usage_index() {
             << std::endl;
   std::cerr << "    -Q      - construct the suffix array by QSufSort instead of libsais."
             << std::endl << std::endl;
-  std::cerr << "Note: `fmsi2 index` accepts only masked superstrings - these can be computed e.g. by KmerCamel from any FASTA file." << std::endl << std::endl;
+  std::cerr << "Note: `fmsi2 legacy index` accepts only masked superstrings - these can be computed e.g. by KmerCamel from any FASTA file." << std::endl << std::endl;
   return 1;
 }
 
 static int usage_merge() {
   std::cerr << std::endl << 
-      "Usage:   fmsi2 merge [options]"
+      "Usage:   fmsi2 legacy merge [options]"
       << std::endl << std::endl;
   std::cerr << std::endl << "Options:" << std::endl;
   std::cerr << "  `-p path_to_fasta`  - The path to the fasta file with "
@@ -68,7 +87,7 @@ static int usage_merge() {
 
 static int usage_op(std::string op) {
   std::cerr << std::endl << 
-      "Usage:   fmsi2 " << op << " [options]"
+      "Usage:   fmsi2 legacy " << op << " [options]"
       << std::endl << std::endl;
   std::cerr << std::endl << "Options:" << std::endl;
   std::cerr << "  `-p path_to_fasta`  - The path to the fasta file with "
@@ -103,7 +122,7 @@ void usage_functions() {
 
 static int usage_query() {
   std::cerr << std::endl;
-  std::cerr << "Usage:   fmsi2 query [options] <index-prefix>" << std::endl << std::endl;
+  std::cerr << "Usage:   fmsi2 legacy query [options] <index-prefix>" << std::endl << std::endl;
   std::cerr << "Options (stable):" << std::endl;
   std::cerr << "  -q FILE - Path to FASTA/FASTQ with queries [default: stdin]"
             << std::endl;
@@ -120,7 +139,7 @@ static int usage_query() {
 
 static int usage_lookup() {
   std::cerr << std::endl;
-  std::cerr << "Usage:   fmsi2 lookup [options] <index-prefix>" << std::endl << std::endl;
+  std::cerr << "Usage:   fmsi2 legacy lookup [options] <index-prefix>" << std::endl << std::endl;
   std::cerr << "Options (stable):" << std::endl;
   std::cerr << "  -q FILE - Path to FASTA/FASTQ with queries [default: stdin]"
             << std::endl;
@@ -138,7 +157,7 @@ static int usage_query(bool lookup) {
 
 static int usage_normalize() {
   std::cerr << std::endl << 
-      "Usage:   fmsi2 compact [options] <index-prefix>"
+      "Usage:   fmsi2 legacy compact [options] <index-prefix>"
       << std::endl << std::endl;
   std::cerr << std::endl << "Options (all experimental):" << std::endl;
   std::cerr << std::endl << "The recognized arguments are:" << std::endl;
@@ -154,14 +173,14 @@ static int usage_normalize() {
 
 static int usage_export() {
   std::cerr << std::endl << 
-      "Usage:   fmsi2 export <index-prefix>"
+      "Usage:   fmsi2 legacy export <index-prefix>"
       << std::endl << std::endl;
     return 1;
 }
 
 static int usage_clean() {
   std::cerr << std::endl << 
-  "Usage:   fmsi2 clean <index-prefix>"
+  "Usage:   fmsi2 legacy clean <index-prefix>"
   << std::endl << std::endl;
   return 1;
 }
@@ -308,7 +327,7 @@ int ms_query(int argc, char *argv[], bool output_orders) {
   fms_index index = load_index(fn, has_klcp);
 
   if (index.sa_transformed_mask.size() == 0) {
-    std::cerr << "ERROR: index not correctly loaded. Ensure that you correctly call `fmsi2 index` before." << std::endl;
+    std::cerr << "ERROR: index not correctly loaded. Ensure that you correctly call `fmsi2 legacy index` before." << std::endl;
     return usage_query(output_orders);
   }
 
@@ -378,6 +397,338 @@ int ms_query(int argc, char *argv[], bool output_orders) {
     std::cout << "\n";
   }
   return 0;
+}
+
+static int usage_index2() {
+  std::cerr << std::endl;
+  std::cerr << "Usage:   fmsi2 index [options] <masked-superstring>" << std::endl << std::endl;
+  std::cerr << "Indexes a masked superstring (FASTA, lower case = masked out; e.g. from KmerCamel) for membership" << std::endl;
+  std::cerr << "queries (fmsi2 query) and dictionary queries (fmsi2 lookup). The index is one file." << std::endl << std::endl;
+  std::cerr << "Options:" << std::endl;
+  std::cerr << "    -o FILE - the index file [default: <masked-superstring>.fmsi]; .fmsi is added if missing" << std::endl;
+  std::cerr << "    -k INT  - size of k-mers [default: number of trailing masked-out characters + 1]" << std::endl << std::endl;
+  std::cerr << "Advanced:" << std::endl;
+  std::cerr << "    -m STR  - layout in memory recommended by the file, which fmsi2 query -m overrides: the encoding of" << std::endl;
+  std::cerr << "              the mask, plain (fast) or rrr (small, slow) [default: plain]" << std::endl;
+  std::cerr << "    -Q      - construct the suffix array by QSufSort instead of libsais" << std::endl << std::endl;
+  return 1;
+}
+
+static int usage_query2(bool lookup) {
+  std::cerr << std::endl;
+  std::cerr << "Usage:   fmsi2 " << (lookup ? "lookup" : "query") << " [options] <index.fmsi>" << std::endl << std::endl;
+  if (lookup) {
+    std::cerr << "Dictionary queries: prints, for every sequence of the queries, the hashes of its k-mers (-1 for a k-mer" << std::endl;
+    std::cerr << "that is not in the set). With a min-one mask the hashes are a minimal perfect hash, 0 to (number of" << std::endl;
+    std::cerr << "k-mers - 1)." << std::endl << std::endl;
+  } else {
+    std::cerr << "Membership queries: prints, for every sequence of the queries, a string of 1 (in the set) and 0 for its" << std::endl;
+    std::cerr << "k-mers. Works with any mask." << std::endl << std::endl;
+  }
+  std::cerr << "Options:" << std::endl;
+  std::cerr << "  -q FILE - FASTA/FASTQ with the queries, may be gzipped [default: stdin]" << std::endl;
+  std::cerr << "  -S      - streamed queries: search the k-mers of a sequence by extending the match of the previous one" << std::endl;
+  std::cerr << "            (for reads and longer sequences)" << std::endl;
+  std::cerr << "  -t INT  - number of threads [default: 1]" << std::endl << std::endl;
+  std::cerr << "Advanced:" << std::endl;
+  std::cerr << "  -m STR  - encoding of the mask in memory: plain (fast) or rrr (small, slow)" << std::endl;
+  std::cerr << "            [default: as the index file recommends]" << std::endl;
+  std::cerr << "  -b INT  - number of k-mers (or sequences if -S) searched at the same time; 1 turns batching off [default: 32]" << std::endl;
+  std::cerr << "  -p INT  - length of the patterns with tabulated SA intervals; 0 turns the table off [default: 10]" << std::endl;
+  std::cerr << "  -O      - accepted and ignored (the option of FMSI 1 for max-one masks; any mask is tested)" << std::endl;
+  std::cerr << "  -k INT  - size of k-mers, checked against the index" << std::endl;
+  std::cerr << std::endl;
+  return 1;
+}
+
+/// The path given to -o or the masked superstring, with the extension of index files.
+static std::string index_file_name(const std::string &name) {
+  const std::string extension = fmsi2::INDEX_EXTENSION;
+  if (name.size() >= extension.size() && name.compare(name.size() - extension.size(), extension.size(), extension) == 0) return name;
+  return name + extension;
+}
+
+/// The option -m of a layout; false if the value is not valid.
+static bool parse_layout_option(const char *value, fmsi2::layout &layout) {
+  fmsi2::mask_kind kind;
+  if (!fmsi2::parse_mask_name(value, kind)) {
+    std::cerr << "ERROR: Mask encoding '" << value << "' not recognized." << std::endl;
+    return false;
+  }
+  layout.mask = (int)kind;
+  return true;
+}
+
+int ms_index2(int argc, char *argv[]) {
+  int c;
+  bool usage = false;
+  std::string fn;
+
+  if (argc > 1 && std::string(argv[argc - 1]) != "-h") {
+    fn = argv[argc - 1];
+    argc--;
+  }
+
+  int k = 0;
+  bool use_qsufsort = false;
+  std::string prefix;
+  // The layout in memory that the file recommends: the fastest one unless -m is given.
+  fmsi2::layout layout;
+  while ((c = getopt(argc, argv, "hk:m:o:Q")) >= 0) {
+    switch (c) {
+    case 'h':
+      usage = true;
+      break;
+    case 'k':
+      k = atoi(optarg);
+      break;
+    case 'm':
+      if (!parse_layout_option(optarg, layout)) return usage_index2();
+      break;
+    case 'o':
+      prefix = optarg;
+      break;
+    case 'Q':
+      use_qsufsort = true;
+      break;
+    default:
+      return usage_index2();
+    }
+  }
+  if (usage) {
+    usage_index2();
+    return 0;
+  } else if (fn.empty()) {
+    std::cerr << "ERROR: Path to the masked superstring is a required argument." << std::endl;
+    return usage_index2();
+  }
+  const std::string index_path = index_file_name(prefix.empty() ? fn : prefix);
+  if (layout.mask < 0) layout.mask = fmsi2::default_layout().mask;
+
+  auto ms = read_masked_superstring(fn);
+  if (ms.size() == 0) {
+    std::cerr << "ERROR: The file '" << fn << "' does not contain a masked superstring." << std::endl;
+    return usage_index2();
+  }
+  std::cerr << "Read masked superstring of length " << ms.size() << std::endl;
+  if (k == 0) {
+    k = infer_k(ms);
+    std::cerr << "Inferred k from the masked case convention: " << k << std::endl;
+  }
+
+  size_t length = ms.size();
+  mbwt m = compute_mbwt<uint64_t>(ms, k, false, use_qsufsort);
+  std::cerr << "Constructed the masked Burrows-Wheeler transform" << std::endl;
+  std::string().swap(ms);
+  // The index is written from the MBWT; its layout in memory is built when it is loaded.
+  fmsi2::save_mbwt(m, k, layout, index_path);
+  const double index_bytes = (double)std::filesystem::file_size(index_path);
+  std::cerr << "Written " << index_path << ": " << (uint64_t)index_bytes << " bytes (" << 8 * index_bytes / length
+            << " bits per character of the superstring)" << std::endl;
+  return 0;
+}
+
+template <bool hashes>
+int run_query2(const fmsi2::index &index, std::string query_fn, unsigned batch_size, bool streaming, unsigned threads,
+               fmsi2::lookup_stats &stats) {
+  typedef typename std::conditional<hashes, int64_t, int8_t>::type out_t;
+  const size_t k = index.k;
+  // Number of bases searched together; the output of a chunk is printed at once.
+  const size_t chunk_bases = (size_t)threads << 22;
+
+  gzFile fp = OpenFile(query_fn);
+  kseq_t *seq = kseq_init(fp);
+
+  struct record {
+    std::string name;
+    size_t offset, length;
+  };
+  std::string sequences;
+  std::vector<record> records;
+  std::vector<uint32_t> offsets;
+  std::vector<fmsi2::segment> segments;
+  std::vector<out_t> results;
+  std::string output;
+
+  auto flush = [&]() {
+    offsets.clear();
+    segments.clear();
+    for (auto &r : records) {
+      // Stretches of valid characters.
+      size_t valid = 0;
+      for (size_t i = 0; i <= r.length; ++i) {
+        if (i < r.length && nucleotideToInt[(uint8_t)sequences[r.offset + i]] != 4) {
+          ++valid;
+          if (valid >= k) offsets.push_back(r.offset + i + 1 - k);
+        } else {
+          if (valid >= k) segments.push_back({(uint32_t)(r.offset + i - valid), (uint32_t)valid});
+          valid = 0;
+        }
+      }
+    }
+    // K-mers with invalid characters are reported as absent.
+    results.assign(sequences.size(), hashes ? -1 : 0);
+    // The index is read-only and the results of the k-mers are disjoint, so the work is split evenly.
+    size_t total = streaming ? segments.size() : offsets.size();
+    auto search = [&](size_t begin, size_t end, fmsi2::lookup_stats &part) {
+      if (streaming) {
+        fmsi2::lookup_streaming<hashes, out_t>(index, sequences.data(), segments.data() + begin, end - begin,
+                                               results.data(), batch_size, part);
+      } else {
+        fmsi2::lookup_batch<hashes, out_t>(index, sequences.data(), offsets.data() + begin, end - begin,
+                                           results.data(), batch_size, part);
+      }
+    };
+    auto start = std::chrono::steady_clock::now();
+    std::vector<fmsi2::lookup_stats> parts(threads);
+    std::vector<std::thread> workers;
+    for (unsigned t = 1; t < threads; ++t) {
+      workers.emplace_back(search, total * t / threads, total * (t + 1) / threads, std::ref(parts[t]));
+    }
+    search(0, total / threads, parts[0]);
+    for (auto &worker : workers) worker.join();
+    for (auto &part : parts) stats.add(part);
+    stats.seconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    output.clear();
+    for (auto &r : records) {
+      output += r.name;
+      output += '\t';
+      for (size_t i = 0; i + k <= r.length; ++i) {
+        if (hashes) {
+          if (i > 0) output += ',';
+          output += std::to_string(results[r.offset + i]);
+        } else {
+          output += (char)('0' + results[r.offset + i]);
+        }
+      }
+      output += '\n';
+    }
+    fwrite(output.data(), 1, output.size(), stdout);
+    sequences.clear();
+    records.clear();
+  };
+
+  int64_t sequence_length;
+  while ((sequence_length = kseq_read(seq)) >= 0) {
+    if (sequences.size() + sequence_length >= UINT32_MAX) {
+      flush();
+      if ((size_t)sequence_length >= UINT32_MAX) {
+        std::cerr << "ERROR: Query sequences of 4 Gbp and more are not supported." << std::endl;
+        return 1;
+      }
+    }
+    records.push_back({seq->name.s, sequences.size(), (size_t)sequence_length});
+    sequences.append(seq->seq.s, sequence_length);
+    if (sequences.size() >= chunk_bases) flush();
+  }
+  flush();
+  kseq_destroy(seq);
+  gzclose(fp);
+  return 0;
+}
+
+int ms_query2(int argc, char *argv[], bool output_orders) {
+  bool usage = false;
+  int c;
+  int k = 0;
+  std::string fn;
+
+  if (argc > 1 && std::string(argv[argc - 1]) != "-h") {
+    fn = argv[argc - 1];
+    argc--;
+  }
+
+  std::string query_fn = "-";
+  int batch_size = 32;
+  int prefix_length = 10;
+  bool streaming = false;
+  int threads = 1;
+  fmsi2::layout layout;
+  while ((c = getopt(argc, argv, "hq:k:b:p:St:m:O")) >= 0) {
+    switch (c) {
+    case 'h':
+      usage = true;
+      break;
+    case 'q':
+      query_fn = optarg;
+      break;
+    case 'k':
+      k = atoi(optarg);
+      break;
+    case 'S':
+      streaming = true;
+      break;
+    case 't':
+      threads = atoi(optarg);
+      break;
+    case 'b':
+      batch_size = atoi(optarg);
+      break;
+    case 'p':
+      prefix_length = atoi(optarg);
+      break;
+    case 'm':
+      if (!parse_layout_option(optarg, layout)) return usage_query2(output_orders);
+      break;
+    case 'O':
+      // The option of FMSI 1 for max-one masks: not needed, as any mask is tested.
+      break;
+    default:
+      return usage_query2(output_orders);
+    }
+  }
+  if (usage) {
+    usage_query2(output_orders);
+    return 0;
+  } else if (fn.empty()) {
+    std::cerr << "ERROR: The index file is a required argument." << std::endl;
+    return usage_query2(output_orders);
+  } else if (batch_size < 1 || threads < 1 || prefix_length < 0 || prefix_length > 14) {
+    std::cerr << "ERROR: The batch size and the number of threads must be positive and the table pattern length between 0 and 14." << std::endl;
+    return usage_query2(output_orders);
+  }
+
+  auto start = std::chrono::steady_clock::now();
+  auto seconds_since_start = [&]() {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+  };
+
+  const std::string index_path = fmsi2::find_index_file(fn);
+  if (index_path.empty()) {
+    std::cerr << "ERROR: No index file " << fn << " (nor " << fn << fmsi2::INDEX_EXTENSION << ")." << std::endl;
+    return 1;
+  }
+  fmsi2::index index;
+  fmsi2::load(index, index_path, threads, layout);
+  if (k != 0 && k != (int)index.k) {
+    std::cerr << "ERROR: Mismatch. Provided k (" << k << ") does not match the k of the index (" << index.k << ")." << std::endl;
+    return usage_query2(output_orders);
+  }
+  double load_seconds = seconds_since_start();
+  fmsi2::build_prefix_table(index, prefix_length);
+  double table_seconds = seconds_since_start() - load_seconds;
+  // Resident memory once the index is ready, and the peak of loading it.
+  const uint64_t loaded_bytes = fmsi2::resident_bytes(), load_peak_bytes = fmsi2::peak_resident_bytes();
+
+  fmsi2::lookup_stats stats;
+  int ret = output_orders ? run_query2<true>(index, query_fn, batch_size, streaming, threads, stats)
+                          : run_query2<false>(index, query_fn, batch_size, streaming, threads, stats);
+  fflush(stdout);
+
+  std::cerr << "[fmsi2]"
+            << "\tkmers=" << stats.kmers << "\tfound=" << stats.found
+            << "\tsteps_per_kmer=" << (stats.kmers ? (double)stats.steps / stats.kmers : 0)
+            << "\tsearches=" << stats.searches << "\trechecks=" << stats.rechecks
+            << "\tthreads=" << threads
+            << "\tmask=" << fmsi2::mask_name(index.mask_type)
+            << "\tindex_bytes_in_memory=" << index.bytes()
+            << "\tloaded_rss_kb=" << loaded_bytes / 1000 << "\tload_peak_rss_kb=" << load_peak_bytes / 1000
+            << "\tend_rss_kb=" << fmsi2::resident_bytes() / 1000 << "\tpeak_rss_kb=" << fmsi2::peak_resident_bytes() / 1000
+            << "\tload_s=" << load_seconds << "\ttable_s=" << table_seconds
+            << "\tsearch_s=" << stats.seconds
+            << "\tsearch_ns_per_kmer=" << (stats.kmers ? 1e9 * stats.seconds / stats.kmers : 0)
+            << "\ttotal_s=" << seconds_since_start() << std::endl;
+  return ret;
 }
 
 int ms_merge(int argc, char *argv[]) {
@@ -537,7 +888,7 @@ int ms_export(int argc, char *argv[]) {
     fms_index index = load_index(fn);
 
     if (index.sa_transformed_mask.size() == 0) {
-      std::cerr << "ERROR: index not correctly loaded. Ensure that you correctly call `fmsi2 index` before." << std::endl;
+      std::cerr << "ERROR: index not correctly loaded. Ensure that you correctly call `fmsi2 legacy index` before." << std::endl;
       return usage_export();
     }
 
@@ -671,35 +1022,96 @@ int ms_clean(int argc, char *argv[]) {
   return 0;
 }
 
+/// Print what an index file holds: its metadata and its sections.
+int ms_info(int argc, char *argv[]) {
+  bool check = false;
+  static const struct option long_options[] = {{"check", no_argument, nullptr, 'C'}, {nullptr, 0, nullptr, 0}};
+  int c;
+  auto usage = []() {
+    std::cerr << std::endl << "Usage:   fmsi2 info [--check] <index.fmsi>" << std::endl << std::endl;
+    std::cerr << "Prints what the index file holds and how: the description of the index, the sections of the file with" << std::endl;
+    std::cerr << "their encodings and sizes. --check verifies the checksums." << std::endl << std::endl;
+    return 1;
+  };
+  while ((c = getopt_long(argc, argv, "h", long_options, nullptr)) >= 0) {
+    if (c == 'C') {
+      check = true;
+    } else {
+      return usage();
+    }
+  }
+  if (optind != argc - 1) return usage();
+  const std::string name = argv[optind], path = fmsi2::find_index_file(name);
+  if (path.empty()) {
+    std::cerr << "ERROR: No index file " << name << "." << std::endl;
+    return 1;
+  }
+  auto print = [&](const std::string &file_path) {
+    fmsi2::file::reader in(file_path);
+    const fmsi2::file::metadata meta = in.meta();
+    std::cout << "file\t" << file_path << std::endl;
+    std::cout << "format\t" << in.version() << std::endl;
+    std::cout << "bytes\t" << in.file_bytes() << std::endl;
+    for (const auto &item : meta.items()) std::cout << item.first << "\t" << item.second << std::endl;
+    if (meta.has("rows") && meta.get("kind") == "index") {
+      // The rows include the sentinel.
+      const double characters = (double)(meta.number("rows") - 1);
+      std::cout << "superstring_characters\t" << (uint64_t)characters << std::endl;
+      std::cout << "bits_per_superstring_character\t" << 8.0 * in.file_bytes() / characters << std::endl;
+    }
+    for (const auto &e : in.sections()) {
+      std::cout << "section\t" << e.name() << "\tencoding=" << e.encoding << "\tflags=" << ((e.flags & fmsi2::file::REQUIRED) ? "required" : "optional")
+                << ((e.flags & fmsi2::file::DEFLATE) ? ",deflate" : "") << "\titems=" << e.items << "\tbytes_in_file=" << e.stored_bytes
+                << "\tbytes=" << e.raw_bytes;
+      if (check) {
+        in.read(e, 1, [](uint64_t, const uint8_t *, size_t) {}, true);
+        std::cout << "\tchecksum=ok";
+      }
+      std::cout << std::endl;
+    }
+  };
+  print(path);
+  return 0;
+}
+
+/// The commands of FMSI 1.
+static int legacy(int argc, char *argv[]) {
+  if (argc < 2) return usage_legacy();
+  std::string op = argv[1];
+  if (op == "index") return ms_index(argc - 1, argv + 1);
+  if (op == "query") return ms_query(argc - 1, argv + 1, false);
+  if (op == "lookup") return ms_query(argc - 1, argv + 1, true);
+  if (op == "clean") return ms_clean(argc - 1, argv + 1);
+  if (op == "merge") return ms_merge(argc - 1, argv + 1);
+  // Recognize "normalize" for backwards compatibility
+  if (op == "normalize" || op == "compact") return ms_normalize(argc - 1, argv + 1);
+  if (op == "export") return ms_export(argc - 1, argv + 1);
+  if (op == "union" || op == "inter" || op == "diff" || op == "symdiff") return ms_op(argc, argv, op);
+  if (op == "-h") {
+    usage_legacy();
+    return 0;
+  }
+  return usage_legacy();
+}
+
 int main(int argc, char *argv[]) {
-  int ret;
   if (argc < 2)
     return usage();
   std::string op = argv[1];
-  if (op == "index")
-    ret = ms_index(argc - 1, argv + 1);
-  else if (op == "query")
-    ret = ms_query(argc - 1, argv + 1, false);
-  else if (op == "lookup")
-    ret = ms_query(argc - 1, argv + 1, true);
-  else if (op == "clean")
-    ret = ms_clean(argc - 1, argv + 1);
-  else if (op == "merge")
-    ret = ms_merge(argc - 1, argv + 1);
-  // Recognize "normalize" for backwards compatibility
-  else if (op == "normalize" || op == "compact")
-    ret = ms_normalize(argc - 1, argv + 1);
-  else if (op == "export")
-    ret = ms_export(argc - 1, argv + 1);
-  else if (op == "union" || op == "inter" || op == "diff" || op == "symdiff")
-    ret = ms_op(argc, argv, op);
-  else if (op == "-v")
-    return version();
-  else if (op == "-h") {
+  try {
+    if (op == "index") return ms_index2(argc - 1, argv + 1);
+    if (op == "query") return ms_query2(argc - 1, argv + 1, false);
+    if (op == "lookup") return ms_query2(argc - 1, argv + 1, true);
+    if (op == "info") return ms_info(argc - 1, argv + 1);
+    if (op == "legacy") return legacy(argc - 1, argv + 1);
+  } catch (const std::exception &error) {
+    std::cerr << "ERROR: " << error.what() << std::endl;
+    return 1;
+  }
+  if (op == "-v") return version();
+  if (op == "-h") {
     usage();
     return 0;
-  } else
-    return usage();
-
-  return ret;
+  }
+  return usage();
 }
