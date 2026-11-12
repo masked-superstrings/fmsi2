@@ -22,7 +22,9 @@
 #include <sdsl/bit_vectors.hpp>
 
 #include "fms_index.h"
+#include "index_file.h"
 #include "rank2.h"
+#include "version.h"
 
 namespace fmsi2 {
 
@@ -117,6 +119,251 @@ void build(index &ix, mbwt &m, int k, mask_kind mask_type) {
     }
     m.sa_transformed_mask.resize(0);
     ix.mask_ones = ix.mask_rank(ix.size);
+}
+
+/// The layout of an index in memory. It is chosen when the index is loaded, as the file holds the BWT and the
+/// mask in a form of its own; the file recommends one.
+struct layout {
+    /// Encoding of the mask (a mask_kind); -1 stands for the recommended one.
+    int mask = -1;
+};
+
+/// The layout that a file recommends unless fmsi2 index is told otherwise (-m): the one that answers the
+/// fastest (the plain mask).
+inline layout default_layout() {
+    layout result;
+    result.mask = (int)mask_kind::plain;
+    return result;
+}
+
+inline const char *mask_name(mask_kind kind) {
+    return kind == mask_kind::plain ? "plain" : "rrr";
+}
+
+inline bool parse_mask_name(const std::string &name, mask_kind &kind) {
+    if (name == "plain") {
+        kind = mask_kind::plain;
+    } else if (name == "rrr") {
+        kind = mask_kind::rrr;
+    } else {
+        return false;
+    }
+    return true;
+}
+
+/// Format 2 (index_file.h): one file with tagged sections. The sections of an index:
+///   META  text, key=value per line (below)
+///   BWT   encoding 1: the characters of the BWT, 2 bits each, 4 per byte (character i at bits 2 (i % 4) of
+///         byte i / 4), the sentinel stored as A; not compressed, as it does not compress
+///   MASK  encoding 1: the mask in the order of the suffix array, one bit per row (bit i at bit i % 8 of byte
+///         i / 8); compressed
+/// The rank counts of the BWT and of the mask and the table of the first search steps are not stored: they are
+/// computed when the file is loaded, in the layout asked for.
+///
+/// Keys of META of an index: kind (index), creator, k, rows (the length of the BWT), dollar (the row of the
+/// sentinel), counts (the four cumulative character counts), mask_ones, mask_order (sa), layout (the recommended
+/// layout in memory: the mask encoding). Unknown keys are ignored.
+static const uint32_t ENCODING_BWT_PACKED = 1;
+static const uint32_t ENCODING_MASK_SA_BITS = 1;
+static const char *const INDEX_EXTENSION = ".fmsi";
+
+/// The mask as a bitvector, whatever its encoding.
+inline sdsl::bit_vector mask_bits(const index &ix) {
+    sdsl::bit_vector bits(ix.size, 0);
+    for (size_t i = 0; i < ix.size; ++i) {
+        if (ix.mask_get(i)) bits[i] = 1;
+    }
+    return bits;
+}
+
+/// What a file says about its index besides the BWT and the mask.
+struct description {
+    uint32_t k = 0;
+    uint64_t rows = 0;
+    uint64_t dollar_position = 0;
+    uint64_t counts[4] = {0, 0, 0, 0};
+    uint64_t mask_ones = 0;
+    layout recommended;
+};
+
+inline std::string creator() { return std::string("fmsi2 ") + VERSION; }
+
+/// Write an index file. bwt(begin, end, buffer) gives the bytes [begin, end) of the packed BWT, mask(begin, end,
+/// buffer) those of the mask; both are called from several threads.
+inline void write_index_file(const std::string &path, const description &d,
+                             const std::function<void(uint64_t, uint64_t, uint8_t *)> &bwt,
+                             const std::function<void(uint64_t, uint64_t, uint8_t *)> &mask, unsigned threads = 1) {
+    file::metadata meta;
+    meta.set("kind", "index");
+    meta.set("creator", creator());
+    meta.set("k", d.k);
+    meta.set("rows", d.rows);
+    meta.set("dollar", d.dollar_position);
+    meta.set("counts", std::to_string(d.counts[0]) + "," + std::to_string(d.counts[1]) + "," + std::to_string(d.counts[2]) +
+                           "," + std::to_string(d.counts[3]));
+    meta.set("mask_ones", d.mask_ones);
+    meta.set("mask_order", "sa");
+    meta.set("layout", mask_name((mask_kind)d.recommended.mask));
+    const std::string text = meta.text();
+
+    file::writer out(path);
+    out.add("META", 1, file::REQUIRED, meta.items().size(), text.data(), text.size());
+    out.add_stream("BWT", ENCODING_BWT_PACKED, file::REQUIRED, d.rows, (d.rows + 3) / 4, false, threads, bwt);
+    out.add_stream("MASK", ENCODING_MASK_SA_BITS, file::REQUIRED, d.rows, (d.rows + 7) / 8, true, threads, mask);
+    out.finish();
+}
+
+/// Bytes [begin, end) of a bit vector of sdsl, bit i at bit i % 8 of byte i / 8.
+inline void bit_vector_bytes(const sdsl::bit_vector &bits, uint64_t begin, uint64_t end, uint8_t *buffer) {
+    // The words of the vector cover its bits; a byte past them is zero.
+    const uint64_t available = ((bits.size() + 63) / 64) * 8;
+    const uint64_t stop = std::min(end, available);
+    if (begin < stop) memcpy(buffer, reinterpret_cast<const uint8_t *>(bits.data()) + begin, stop - begin);
+    if (stop < end) memset(buffer + (std::max(begin, stop) - begin), 0, end - std::max(begin, stop));
+}
+
+/// Write the index of an MBWT to a file, without building the index in memory. Returns its description.
+inline description save_mbwt(const mbwt &m, int k, layout recommended, const std::string &path, unsigned threads = 1) {
+    description d;
+    d.k = k;
+    d.rows = m.bwt.size();
+    d.dollar_position = m.dollar_position;
+    d.recommended = recommended;
+    uint64_t totals[4] = {0, 0, 0, 0};
+    for (size_t i = 0; i < m.bwt.size(); ++i) totals[m.bwt[i]]++;
+    // The count of A includes the sentinel, which stands for the smallest suffix.
+    d.counts[0] = 1;
+    d.counts[1] = totals[0];
+    d.counts[2] = totals[0] + totals[1];
+    d.counts[3] = totals[0] + totals[1] + totals[2];
+    const uint64_t *words = m.sa_transformed_mask.data();
+    for (size_t w = 0; w < (m.sa_transformed_mask.size() + 63) / 64; ++w) d.mask_ones += __builtin_popcountll(words[w]);
+    write_index_file(
+        path, d,
+        [&](uint64_t begin, uint64_t end, uint8_t *buffer) {
+            for (uint64_t b = begin; b < end; ++b) {
+                uint8_t packed = 0;
+                for (uint64_t i = 4 * b; i < std::min<uint64_t>(4 * b + 4, d.rows); ++i) packed |= m.bwt[i] << (2 * (i & 3));
+                buffer[b - begin] = packed;
+            }
+        },
+        [&](uint64_t begin, uint64_t end, uint8_t *buffer) { bit_vector_bytes(m.sa_transformed_mask, begin, end, buffer); }, threads);
+    return d;
+}
+
+inline description describe(const index &ix) {
+    description d;
+    d.k = ix.k;
+    d.rows = ix.size;
+    d.dollar_position = ix.dollar_position;
+    for (int c = 0; c < 4; ++c) d.counts[c] = ix.counts[c];
+    d.mask_ones = ix.mask_ones;
+    d.recommended.mask = (int)ix.mask_type;
+    return d;
+}
+
+/// Write an index that is in memory to a file; the file recommends its layout, or the given one.
+inline void save(const index &ix, const std::string &path, unsigned threads = 1, const layout *recommended = nullptr) {
+    description d = describe(ix);
+    if (recommended != nullptr) d.recommended = *recommended;
+    write_index_file(
+        path, d, [&](uint64_t begin, uint64_t end, uint8_t *buffer) { ix.bwt.get_packed(begin, buffer, end - begin); },
+        [&](uint64_t begin, uint64_t end, uint8_t *buffer) {
+            for (uint64_t b = begin; b < end; ++b) {
+                uint8_t byte = 0;
+                for (uint64_t i = 8 * b; i < std::min<uint64_t>(8 * b + 8, ix.size); ++i) byte |= (uint8_t)ix.mask_get(i) << (i & 7);
+                buffer[b - begin] = byte;
+            }
+        },
+        threads);
+}
+
+/// The bits of the pieces of a section, 64 at a time: sink(first bit, word, count).
+template <typename sink_t>
+inline void for_each_word(uint64_t offset, const uint8_t *data, size_t bytes, uint64_t total_bits, sink_t sink) {
+    if (offset % 8 != 0) throw std::logic_error("pieces of a section must start at whole words");
+    for (size_t b = 0; b < bytes && 8 * (offset + b) < total_bits; b += 8) {
+        uint64_t word = 0;
+        memcpy(&word, data + b, std::min<size_t>(8, bytes - b));
+        const uint64_t first = 8 * (offset + b);
+        sink(first, word, (unsigned)std::min<uint64_t>(64, total_bits - first));
+    }
+}
+
+/// The description of an index file.
+inline description read_description(const file::reader &in) {
+    const file::metadata meta = in.meta();
+    if (meta.get("kind") != "index") throw std::invalid_argument("file " + in.path() + " is not an index of FMSI 2");
+    description d;
+    d.k = (uint32_t)meta.number("k");
+    d.rows = meta.number("rows");
+    d.dollar_position = meta.number("dollar");
+    d.mask_ones = meta.number("mask_ones");
+    std::istringstream counts(meta.get("counts"));
+    std::string item;
+    for (int c = 0; c < 4; ++c) {
+        if (!std::getline(counts, item, ',')) throw std::invalid_argument("file " + in.path() + " has no character counts");
+        d.counts[c] = std::stoull(item);
+    }
+    d.recommended = default_layout();
+    mask_kind kind;
+    if (parse_mask_name(meta.get("layout"), kind)) d.recommended.mask = (int)kind;
+    if (meta.get("mask_order", "sa") != "sa") {
+        throw std::invalid_argument("file " + in.path() + " stores its mask in an order that this version of FMSI does not know");
+    }
+    return d;
+}
+
+/// Load an index in the given layout (by default the one the file recommends). The BWT is read into its blocks
+/// and the mask decoded into its encoding piece by piece, so that the peak memory is that of the loaded index;
+/// the sections are read on the given threads.
+inline void load(index &ix, const std::string &path, unsigned threads = 1, layout wanted = layout()) {
+    file::reader in(path);
+    in.check_known({"META", "BWT", "MASK"});
+    const description d = read_description(in);
+    ix.k = d.k;
+    ix.size = d.rows;
+    ix.dollar_position = d.dollar_position;
+    for (int c = 0; c < 4; ++c) ix.counts[c] = d.counts[c];
+    ix.mask_type = (mask_kind)(wanted.mask >= 0 ? wanted.mask : d.recommended.mask);
+
+    const file::section_entry &bwt = in.get("BWT");
+    if (bwt.encoding != ENCODING_BWT_PACKED || bwt.items != d.rows || bwt.raw_bytes != (d.rows + 3) / 4) {
+        throw std::invalid_argument("file " + path + " stores its BWT in a form that this version of FMSI does not know");
+    }
+    ix.bwt = quad_rank(d.rows);
+    in.read(bwt, threads, [&](uint64_t offset, const uint8_t *data, size_t bytes) { ix.bwt.set_packed(offset, data, bytes); });
+    ix.bwt.finalize();
+
+    const file::section_entry &mask = in.get("MASK");
+    if (mask.encoding != ENCODING_MASK_SA_BITS || mask.items != d.rows || mask.raw_bytes != (d.rows + 7) / 8) {
+        throw std::invalid_argument("file " + path + " stores its mask in a form that this version of FMSI does not know");
+    }
+    if (ix.mask_type == mask_kind::plain) {
+        ix.mask = bit_rank(d.rows);
+        in.read(mask, threads, [&](uint64_t offset, const uint8_t *data, size_t bytes) {
+            for_each_word(offset, data, bytes, d.rows, [&](uint64_t first, uint64_t word, unsigned count) { ix.mask.set_bits(first, word, count); });
+        });
+        ix.mask.finalize();
+    } else {
+        sdsl::bit_vector bits(d.rows, 0);
+        in.read(mask, threads, [&](uint64_t offset, const uint8_t *data, size_t bytes) {
+            for_each_word(offset, data, bytes, d.rows, [&](uint64_t first, uint64_t word, unsigned count) { bits.set_int(first, word, count); });
+        });
+        ix.mask_rrr = sdsl::rrr_vector<RRR_BLOCK_SIZE>(bits);
+        ix.mask_rrr_rank = sdsl::rank_support_rrr<1, RRR_BLOCK_SIZE>(&ix.mask_rrr);
+    }
+    ix.mask_ones = ix.mask_rank(ix.size);
+    if (ix.mask_ones != d.mask_ones) throw std::invalid_argument("file " + path + " is damaged: the mask does not match its description");
+}
+
+/// The file of an index given as the file itself, or as the name without its extension (a prefix, as the
+/// commands of FMSI took it). Empty if there is none.
+inline std::string find_index_file(const std::string &name) {
+    auto is_file = [](const std::string &path) { return file::file_version(path) != 0; };
+    if (is_file(name)) return name;
+    if (is_file(name + INDEX_EXTENSION)) return name + INDEX_EXTENSION;
+    return "";
 }
 
 /// Tabulate the SA intervals of all patterns of the given length. An entry is indexed by the

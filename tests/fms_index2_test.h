@@ -250,6 +250,162 @@ TEST(FMS_INDEX2, HASHES) {
     }
 }
 
+TEST(FMS_INDEX2, SAVE_AND_LOAD) {
+    std::mt19937_64 rng(6);
+    size_t k = 13;
+    std::string ms = random_mask(rng, random_superstring(rng, 3000), k, true);
+    queries q = make_queries(rng, ms, k);
+    for (auto mask_type : {fmsi2::mask_kind::plain, fmsi2::mask_kind::rrr}) {
+        mbwt m = compute_mbwt<uint64_t>(ms, k, false);
+        fmsi2::index built, loaded;
+        fmsi2::build(built, m, k, mask_type);
+        std::string path = testing::TempDir() + "fmsi2_test.fmsi";
+        fmsi2::save(built, path);
+        fmsi2::load(loaded, path);
+        std::filesystem::remove(path);
+        fmsi2::build_prefix_table(built, 6);
+        fmsi2::build_prefix_table(loaded, 6);
+        fmsi2::lookup_stats stats;
+        std::vector<int64_t> want(q.sequences.size(), -1), got(q.sequences.size(), -1);
+        fmsi2::lookup_batch<true, int64_t>(built, q.sequences.data(), q.offsets.data(), q.offsets.size(), want.data(),
+                                           16, stats);
+        fmsi2::lookup_batch<true, int64_t>(loaded, q.sequences.data(), q.offsets.data(), q.offsets.size(), got.data(),
+                                           16, stats);
+        EXPECT_EQ(want, got);
+    }
+}
+
+/// The lookups of an index: the hashes of all query k-mers.
+std::vector<int64_t> hashes_of(fmsi2::index &index, const queries &q) {
+    fmsi2::build_prefix_table(index, 6);
+    fmsi2::lookup_stats stats;
+    std::vector<int64_t> result(q.sequences.size(), -1);
+    fmsi2::lookup_batch<true, int64_t>(index, q.sequences.data(), q.offsets.data(), q.offsets.size(), result.data(), 16, stats);
+    return result;
+}
+
+/// An index file gives the same index in every layout, whichever way it was written.
+TEST(FMS_INDEX2, FILE_LAYOUTS) {
+    std::mt19937_64 rng(7);
+    const std::string path = testing::TempDir() + "fmsi2_layouts_test.fmsi";
+    for (int round = 0; round < 4; ++round) {
+        size_t k = std::vector<size_t>{3, 13, 31, 33}[round % 4];
+        std::string ms = random_mask(rng, random_superstring(rng, k + 100 + rng() % 70000), k, round % 2);
+        queries q = make_queries(rng, ms, k);
+        mbwt m = compute_mbwt<uint64_t>(ms, k, false);
+        fmsi2::save_mbwt(m, k, fmsi2::default_layout(), path, 1 + round % 3);
+        fmsi2::index built;
+        fmsi2::build(built, m, k, fmsi2::mask_kind::plain);
+        const std::vector<int64_t> want = hashes_of(built, q);
+
+        for (int mask : {-1, 0, 1}) {
+            fmsi2::layout layout;
+            layout.mask = mask;
+            fmsi2::index loaded;
+            fmsi2::load(loaded, path, 1 + (mask + 1) % 3, layout);
+            ASSERT_EQ(loaded.k, k);
+            ASSERT_EQ(loaded.size, built.size);
+            ASSERT_EQ(loaded.mask_ones, built.mask_ones);
+            // The recommended layout is the fastest one.
+            if (mask < 0) ASSERT_EQ(loaded.mask_type, fmsi2::mask_kind::plain);
+            for (size_t i = 0; i < loaded.size; i += 1 + rng() % 7) ASSERT_EQ(loaded.mask_get(i), built.mask_get(i)) << "row " << i;
+            ASSERT_EQ(hashes_of(loaded, q), want) << "round " << round << " mask " << mask;
+
+            // An index written from memory is the same file content-wise: it loads to the same index.
+            if (mask == (int)fmsi2::mask_kind::rrr) {
+                fmsi2::save(loaded, path + ".again", 2);
+                fmsi2::index again;
+                fmsi2::load(again, path + ".again");
+                ASSERT_EQ(again.mask_type, fmsi2::mask_kind::rrr);
+                ASSERT_EQ(hashes_of(again, q), want);
+                std::filesystem::remove(path + ".again");
+            }
+        }
+    }
+    std::filesystem::remove(path);
+}
+
+/// Sections that a reader does not know are skipped unless they are required; damaged files are refused.
+TEST(FMS_INDEX2, FILE_SECTIONS) {
+    std::mt19937_64 rng(8);
+    const size_t k = 11;
+    std::string ms = random_mask(rng, random_superstring(rng, 5000000 / 100), k, true);
+    queries q = make_queries(rng, ms, k);
+    mbwt m = compute_mbwt<uint64_t>(ms, k, false);
+    const std::string path = testing::TempDir() + "fmsi2_sections_test.fmsi";
+    fmsi2::save_mbwt(m, k, fmsi2::default_layout(), path);
+    fmsi2::index reference;
+    fmsi2::load(reference, path);
+    const std::vector<int64_t> want = hashes_of(reference, q);
+
+    // Copy the file section by section and add one that no reader knows.
+    auto copy_with = [&](uint32_t flags) {
+        fmsi2::file::reader in(path);
+        fmsi2::file::writer out(path + ".more");
+        for (const auto &e : in.sections()) {
+            const std::string content = in.read_all(e);
+            if (e.flags & fmsi2::file::DEFLATE) {
+                out.add_stream(e.name(), e.encoding, e.flags, e.items, content.size(), true, 2,
+                               [&](uint64_t begin, uint64_t end, uint8_t *buffer) { memcpy(buffer, content.data() + begin, end - begin); });
+            } else {
+                out.add(e.name(), e.encoding, e.flags, e.items, content.data(), content.size());
+            }
+        }
+        const std::string future = "something of a later version";
+        out.add("FUTURE", 7, flags, 1, future.data(), future.size());
+        out.finish();
+    };
+    copy_with(0);
+    {
+        fmsi2::index loaded;
+        fmsi2::load(loaded, path + ".more");
+        ASSERT_EQ(hashes_of(loaded, q), want);
+        fmsi2::file::reader in(path + ".more");
+        ASSERT_EQ(in.sections().size(), 4u);
+        ASSERT_EQ(in.read_all(in.get("FUTURE")), "something of a later version");
+    }
+    copy_with(fmsi2::file::REQUIRED);
+    {
+        fmsi2::index loaded;
+        ASSERT_THROW(fmsi2::load(loaded, path + ".more"), std::invalid_argument);
+    }
+    std::filesystem::remove(path + ".more");
+
+    // Truncated and damaged files.
+    std::ifstream in(path, std::ios::binary);
+    const std::string bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    in.close();
+    auto write = [&](const std::string &content) {
+        std::ofstream out(path + ".bad", std::ios::binary);
+        out.write(content.data(), content.size());
+    };
+    for (size_t size : {(size_t)0, (size_t)10, (size_t)24, bytes.size() / 2, bytes.size() - 1}) {
+        write(bytes.substr(0, size));
+        fmsi2::index loaded;
+        ASSERT_THROW(fmsi2::load(loaded, path + ".bad"), std::invalid_argument) << "size " << size;
+    }
+    {
+        // A flipped bit of the compressed mask: the chunk does not decompress, or the mask does not match.
+        fmsi2::file::reader table(path);
+        const fmsi2::file::section_entry &mask = table.get("MASK");
+        std::string damaged = bytes;
+        damaged[mask.offset + mask.stored_bytes / 3] ^= 0x10;
+        write(damaged);
+        fmsi2::index loaded;
+        ASSERT_THROW(fmsi2::load(loaded, path + ".bad"), std::invalid_argument);
+        // A flipped bit of the BWT is found by the checksum.
+        const fmsi2::file::section_entry &bwt = table.get("BWT");
+        damaged = bytes;
+        damaged[bwt.offset + bwt.stored_bytes / 2] ^= 0x01;
+        write(damaged);
+        fmsi2::file::reader bad(path + ".bad");
+        ASSERT_THROW(bad.read(bad.get("BWT"), 1, [](uint64_t, const uint8_t *, size_t) {}, true), std::invalid_argument);
+        bad.read(bad.get("MASK"), 1, [](uint64_t, const uint8_t *, size_t) {}, true);
+    }
+    std::filesystem::remove(path + ".bad");
+    std::filesystem::remove(path);
+}
+
 /// The container of the index files: sections written and read back, stored as they are and compressed, and the
 /// versions that a reader accepts.
 TEST(INDEX_FILE, SECTIONS) {
