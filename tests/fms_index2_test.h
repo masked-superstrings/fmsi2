@@ -82,6 +82,7 @@ std::set<std::string> represented_kmers(const std::string &ms, size_t k) {
 struct queries {
     std::string sequences;
     std::vector<uint32_t> offsets;
+    std::vector<fmsi2::segment> segments;
 };
 
 queries make_queries(std::mt19937_64 &rng, const std::string &ms, size_t k) {
@@ -102,6 +103,7 @@ queries make_queries(std::mt19937_64 &rng, const std::string &ms, size_t k) {
     queries result;
     for (auto &sequence : sequences) {
         if (sequence.size() < k) continue;
+        result.segments.push_back({(uint32_t)result.sequences.size(), (uint32_t)sequence.size()});
         for (size_t i = 0; i + k <= sequence.size(); ++i) result.offsets.push_back(result.sequences.size() + i);
         result.sequences += sequence;
     }
@@ -189,12 +191,15 @@ TEST(FMS_INDEX2, MEMBERSHIP) {
                 fmsi2::build_prefix_table(index, table);
                 for (unsigned batch : {1, 3, 32}) {
                     fmsi2::lookup_stats stats;
-                    std::vector<int8_t> single(q.sequences.size(), 0);
+                    std::vector<int8_t> single(q.sequences.size(), 0), streamed(q.sequences.size(), 0);
                     fmsi2::lookup_batch<false, int8_t>(index, q.sequences.data(), q.offsets.data(), q.offsets.size(),
                                                        single.data(), batch, stats);
+                    fmsi2::lookup_streaming<false, int8_t>(index, q.sequences.data(), q.segments.data(),
+                                                           q.segments.size(), streamed.data(), batch, stats);
                     for (uint32_t offset : q.offsets) {
                         bool want = represented.count(canonical(q.sequences.substr(offset, k)));
                         ASSERT_EQ((bool)single[offset], want) << "k " << k << " round " << round;
+                        ASSERT_EQ((bool)streamed[offset], want) << "k " << k << " round " << round << " (streaming)";
                     }
                 }
             }
@@ -216,13 +221,16 @@ TEST(FMS_INDEX2, HASHES) {
         fmsi2::build(index, m, k, round % 2 ? fmsi2::mask_kind::plain : fmsi2::mask_kind::rrr);
         fmsi2::build_prefix_table(index, round % 3 * 4);
         fmsi2::lookup_stats stats;
-        std::vector<int64_t> single(q.sequences.size(), -1);
+        std::vector<int64_t> single(q.sequences.size(), -1), streamed(q.sequences.size(), -1);
         fmsi2::lookup_batch<true, int64_t>(index, q.sequences.data(), q.offsets.data(), q.offsets.size(),
                                            single.data(), 7, stats);
+        fmsi2::lookup_streaming<true, int64_t>(index, q.sequences.data(), q.segments.data(), q.segments.size(),
+                                               streamed.data(), 7, stats);
         std::map<std::string, int64_t> hash_of;
         std::set<int64_t> hashes;
         for (uint32_t offset : q.offsets) {
             std::string kmer = canonical(q.sequences.substr(offset, k));
+            ASSERT_EQ(single[offset], streamed[offset]) << "k " << k << " round " << round;
             if (!represented.count(kmer)) {
                 ASSERT_EQ(single[offset], -1);
                 continue;

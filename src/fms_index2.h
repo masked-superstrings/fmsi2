@@ -145,8 +145,9 @@ struct lookup_stats {
     uint64_t found = 0;
     /// Number of steps of the backward search (LF-mappings of an interval).
     uint64_t steps = 0;
-    /// Number of searches started from scratch.
+    /// Number of searches started from scratch, and those of them caused by an unset mask bit of a long match.
     uint64_t searches = 0;
+    uint64_t rechecks = 0;
     double seconds = 0;
 
     void add(const lookup_stats &other) {
@@ -154,6 +155,7 @@ struct lookup_stats {
         found += other.found;
         steps += other.steps;
         searches += other.searches;
+        rechecks += other.rechecks;
     }
 };
 
@@ -281,6 +283,262 @@ void lookup_batch(const index &ix, const char *sequence, const uint32_t *offsets
     stats.found += found;
     stats.steps += steps;
     stats.searches += searches;
+}
+
+/// A stretch of a query sequence without invalid characters, at least k characters long.
+struct segment {
+    uint32_t offset, length;
+};
+
+/// Look up all k-mers of the segments by streaming, [batch_size] segments at a time; the results
+/// are as in lookup_batch (out must be initialized to 0, or to -1 if [hashes]).
+///
+/// A segment is searched on one strand and the k-mers not found there on the other one. On a strand,
+/// the k-mers (windows) are resolved from the right to the left: the match of a window is extended by one
+/// character to the match of the next one, so the match can get longer than k. A longer match has a
+/// subset of the occurrences of the k-mer, hence a set mask bit proves the k-mer represented, while an
+/// unset one requires searching the k-mer itself. This needs no kLCP array.
+///
+/// When a window cannot be found, the search stopped on a substring that does not occur in the
+/// superstring, so that all windows containing it are absent on this strand. To find such substrings
+/// cheaply, the unresolved windows containing the position where the search stopped are searched
+/// starting from the lowest one, whose search stops the earliest.
+template <bool hashes, typename out_t>
+void lookup_streaming(const index &ix, const char *sequence, const segment *segments, size_t count, out_t *out,
+                      unsigned batch_size, lookup_stats &stats) {
+    const int k = ix.k;
+    const int p = ix.prefix_length;
+    const uint64_t *table = ix.prefix_table.data();
+    // Values of out while a segment is processed; a non-negative hash or 1 means found.
+    const out_t UNRESOLVED = hashes ? -1 : 0;
+    const out_t ABSENT[2] = {(out_t)(hashes ? -2 : 2), (out_t)(hashes ? -3 : 3)};
+    const int NO_BLOCK = -1;
+
+    enum : uint8_t { IDLE, START, SEARCH, CHECK };
+    struct slot {
+        size_t i, j;
+        const char *sequence;
+        /// Results of the windows of the segment.
+        out_t *out;
+        uint64_t key;
+        int32_t length, windows;
+        /// The window searched or matched, in the coordinates of the strand.
+        int32_t x;
+        /// Number of characters of the window already searched.
+        int32_t t;
+        /// The highest unresolved window if the lowest one of a block is searched, NO_BLOCK otherwise.
+        int32_t block_top;
+        /// Windows above this one are searched from the top only.
+        int32_t top_only_above;
+        int32_t hits[2];
+        uint8_t state;
+        /// Whether the reverse complement is searched, and whether it is the second strand,
+        /// and whether the matched string has exactly k characters.
+        uint8_t reverse, second, exact;
+    };
+    std::vector<slot> slots(std::max(1u, batch_size));
+    size_t next = 0, active = slots.size();
+    int score = 0;
+    uint64_t found = 0, steps = 0, kmers = 0, searches = 0, rechecks = 0;
+
+    // Character of the strand at position v, and the result of its window y.
+    auto symbol = [&](const slot &s, int v) -> byte {
+        return s.reverse ? 3 - nucleotideToInt[(uint8_t)s.sequence[s.length - 1 - v]]
+                         : nucleotideToInt[(uint8_t)s.sequence[v]];
+    };
+    auto result = [&](const slot &s, int y) -> out_t & { return s.out[s.reverse ? s.windows - 1 - y : y]; };
+    auto unresolved = [&](const slot &s, int y) {
+        out_t value = result(s, y);
+        return value == UNRESOLVED || (s.second && value == ABSENT[0]);
+    };
+
+    std::function<void(slot &)> load;
+
+    auto begin_search = [&](slot &s, int y) {
+        ++searches;
+        s.x = y;
+        s.t = 0;
+        if (p == 0) {
+            s.i = 0;
+            s.j = ix.size;
+            s.state = SEARCH;
+            return;
+        }
+        uint64_t key = 0;
+        for (int t = 0; t < p; ++t) key = (key << 2) | symbol(s, y + k - 1 - t);
+        s.key = key;
+        s.state = START;
+        __builtin_prefetch(table + 2 * key);
+    };
+    std::function<void(slot &)> strand_done;
+    // Search the highest unresolved window not above [from].
+    auto next_top = [&](slot &s, int from) {
+        while (from >= 0 && !unresolved(s, from)) --from;
+        s.block_top = NO_BLOCK;
+        if (from < 0) {
+            strand_done(s);
+        } else {
+            begin_search(s, from);
+        }
+    };
+    strand_done = [&](slot &s) {
+        if (!s.second) {
+            s.second = 1;
+            s.reverse ^= 1;
+            s.top_only_above = INT32_MAX;
+            next_top(s, s.windows - 1);
+        } else {
+            for (int y = 0; y < s.windows; ++y) {
+                if (s.out[y] == ABSENT[0] || s.out[y] == ABSENT[1]) s.out[y] = UNRESOLVED;
+            }
+            if (s.hits[0] != s.hits[1]) score = std::max(-7, std::min(7, score + (s.hits[0] > s.hits[1] ? 1 : -1)));
+            load(s);
+        }
+    };
+    load = [&](slot &s) {
+        if (next == count) {
+            s.state = IDLE;
+            --active;
+            return;
+        }
+        const segment &g = segments[next++];
+        s.sequence = sequence + g.offset;
+        s.out = out + g.offset;
+        s.length = g.length;
+        s.windows = g.length - k + 1;
+        kmers += s.windows;
+        s.reverse = score < 0;
+        s.second = 0;
+        s.hits[0] = s.hits[1] = 0;
+        s.top_only_above = INT32_MAX;
+        next_top(s, s.windows - 1);
+    };
+    // The search of window x stopped: the substring from position a to the end of the window does not occur.
+    auto search_failed = [&](slot &s) {
+        int a = s.x + k - s.t;
+        if (s.block_top == NO_BLOCK) {
+            result(s, s.x) = ABSENT[s.second];
+            // The unresolved windows containing position a.
+            int lowest = std::max(0, a - k + 1);
+            int top = s.x - 1;
+            while (top >= lowest && !unresolved(s, top)) --top;
+            if (top < lowest) {
+                next_top(s, top);
+                return;
+            }
+            int bottom = lowest;
+            while (!unresolved(s, bottom)) ++bottom;
+            if (bottom == top || top > s.top_only_above) {
+                begin_search(s, top);
+            } else {
+                s.block_top = top;
+                begin_search(s, bottom);
+            }
+        } else {
+            // All windows from x to a contain the substring.
+            for (int y = s.x; y <= std::min(a, s.block_top); ++y) {
+                if (unresolved(s, y)) result(s, y) = ABSENT[s.second];
+            }
+            int bottom = a + 1;
+            while (bottom <= s.block_top && !unresolved(s, bottom)) ++bottom;
+            if (bottom > s.block_top) {
+                next_top(s, s.x - 1);
+            } else if (bottom == s.block_top) {
+                s.block_top = NO_BLOCK;
+                begin_search(s, bottom);
+            } else {
+                begin_search(s, bottom);
+            }
+        }
+    };
+    auto to_check = [&](slot &s) {
+        s.state = CHECK;
+        ix.mask_prefetch(s.i);
+        ix.bwt.prefetch(s.i);
+        ix.bwt.prefetch(s.j);
+    };
+    auto after_search_step = [&](slot &s) {
+        if (s.i == s.j) {
+            search_failed(s);
+        } else if (s.t == k) {
+            s.exact = 1;
+            to_check(s);
+        } else {
+            s.state = SEARCH;
+            ix.bwt.prefetch(s.i);
+            ix.bwt.prefetch(s.j);
+        }
+    };
+    // The interval is the one of a string starting with window x: resolve the window and go to the next one.
+    auto check = [&](slot &s) {
+        size_t q = s.i;
+        while (q < s.j && !ix.mask_get(q)) ++q;
+        if (q < s.j) {
+            result(s, s.x) = hashes ? (out_t)ix.mask_rank(q) : (out_t)1;
+            ++found;
+            ++s.hits[s.reverse];
+        } else if (!s.exact) {
+            // Other occurrences of the k-mer may be set in the mask.
+            ++rechecks;
+            s.block_top = NO_BLOCK;
+            begin_search(s, s.x);
+            return;
+        } else {
+            result(s, s.x) = ABSENT[s.second];
+        }
+        if (s.block_top != NO_BLOCK) {
+            // The lowest window of a block occurs, so nothing is known about the windows above it.
+            int top = s.block_top;
+            s.top_only_above = s.x;
+            s.block_top = NO_BLOCK;
+            begin_search(s, top);
+            return;
+        }
+        if (s.x == 0 || !unresolved(s, s.x - 1)) {
+            next_top(s, s.x - 1);
+            return;
+        }
+        --s.x;
+        update_range(ix, s.i, s.j, symbol(s, s.x));
+        ++steps;
+        if (s.i == s.j) {
+            begin_search(s, s.x);
+        } else {
+            s.exact = 0;
+            to_check(s);
+        }
+    };
+
+    for (slot &s : slots) load(s);
+    while (active > 0) {
+        for (slot &s : slots) {
+            switch (s.state) {
+            case START:
+                s.i = table[2 * s.key];
+                s.j = table[2 * s.key + 1];
+                s.t = p;
+                after_search_step(s);
+                break;
+            case SEARCH:
+                update_range(ix, s.i, s.j, symbol(s, s.x + k - 1 - s.t));
+                ++s.t;
+                ++steps;
+                after_search_step(s);
+                break;
+            case CHECK:
+                check(s);
+                break;
+            default:
+                break;
+            }
+        }
+    }
+
+    stats.kmers += kmers;
+    stats.found += found;
+    stats.steps += steps;
+    stats.searches += searches;
+    stats.rechecks += rechecks;
 }
 
 } // namespace fmsi2
