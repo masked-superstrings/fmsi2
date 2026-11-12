@@ -408,8 +408,10 @@ static int usage_index2() {
   std::cerr << "    -o FILE - the index file [default: <masked-superstring>.fmsi]; .fmsi is added if missing" << std::endl;
   std::cerr << "    -k INT  - size of k-mers [default: number of trailing masked-out characters + 1]" << std::endl << std::endl;
   std::cerr << "Advanced:" << std::endl;
-  std::cerr << "    -m STR  - layout in memory recommended by the file, which fmsi2 query -m overrides: the encoding of" << std::endl;
-  std::cerr << "              the mask, plain (the fastest), packed (smaller) or rrr (slow) [default: plain]" << std::endl;
+  std::cerr << "    -c INT  - layout in memory recommended by the file, which fmsi2 query -c overrides: bytes per block" << std::endl;
+  std::cerr << "              of the BWT, 64 (the fastest), 128 or 256 (the smallest) [default: 64]" << std::endl;
+  std::cerr << "    -m STR  - likewise the encoding of the mask: plain (the fastest), packed (smaller) or rrr (slow)" << std::endl;
+  std::cerr << "              [default: plain]" << std::endl;
   std::cerr << "    -M STR  - the type of the mask: min-one (every k-mer set once: lookup gives a minimal perfect hash)," << std::endl;
   std::cerr << "              max-one (every occurrence of a k-mer of the set is set), or auto: as the header of the masked" << std::endl;
   std::cerr << "              superstring states it (mask=min-one, as KmerCamel writes), else as computed [default: auto];" << std::endl;
@@ -435,6 +437,8 @@ static int usage_query2(bool lookup) {
   std::cerr << "            (for reads and longer sequences)" << std::endl;
   std::cerr << "  -t INT  - number of threads [default: 1]" << std::endl << std::endl;
   std::cerr << "Advanced:" << std::endl;
+  std::cerr << "  -c INT  - bytes per block of the BWT in memory: 64 (the fastest), 128 or 256 (the smallest)" << std::endl;
+  std::cerr << "            [default: as the index file recommends]" << std::endl;
   std::cerr << "  -m STR  - encoding of the mask in memory: plain (the fastest), packed (smaller) or rrr (slow)" << std::endl;
   std::cerr << "            [default: as the index file recommends]" << std::endl;
   std::cerr << "  -b INT  - number of k-mers (or sequences if -S) searched at the same time; 1 turns batching off [default: 32]" << std::endl;
@@ -452,14 +456,22 @@ static std::string index_file_name(const std::string &name) {
   return name + extension;
 }
 
-/// The option -m of a layout; false if the value is not valid.
-static bool parse_layout_option(const char *value, fmsi2::layout &layout) {
-  fmsi2::mask_kind kind;
-  if (!fmsi2::parse_mask_name(value, kind)) {
-    std::cerr << "ERROR: Mask encoding '" << value << "' not recognized." << std::endl;
-    return false;
+/// The options -c and -m of a layout; false if the value is not valid.
+static bool parse_layout_option(int option, const char *value, fmsi2::layout &layout) {
+  if (option == 'c') {
+    layout.bwt_block_bytes = atoi(value);
+    if (!fmsi2::quad_sequence::valid_block_bytes(layout.bwt_block_bytes)) {
+      std::cerr << "ERROR: The blocks of the BWT can have 64, 128 or 256 bytes." << std::endl;
+      return false;
+    }
+  } else {
+    fmsi2::mask_kind kind;
+    if (!fmsi2::parse_mask_name(value, kind)) {
+      std::cerr << "ERROR: Mask encoding '" << value << "' not recognized." << std::endl;
+      return false;
+    }
+    layout.mask = (int)kind;
   }
-  layout.mask = (int)kind;
   return true;
 }
 
@@ -476,10 +488,10 @@ int ms_index2(int argc, char *argv[]) {
   int k = 0;
   bool use_qsufsort = false;
   std::string prefix;
-  // The layout in memory that the file recommends: the fastest one unless -m is given.
+  // The layout in memory that the file recommends: the fastest one unless -c or -m is given.
   fmsi2::layout layout;
   std::string mask_type = "auto";
-  while ((c = getopt(argc, argv, "hk:m:o:QM:")) >= 0) {
+  while ((c = getopt(argc, argv, "hk:m:c:o:QM:")) >= 0) {
     switch (c) {
     case 'h':
       usage = true;
@@ -487,8 +499,9 @@ int ms_index2(int argc, char *argv[]) {
     case 'k':
       k = atoi(optarg);
       break;
+    case 'c':
     case 'm':
-      if (!parse_layout_option(optarg, layout)) return usage_index2();
+      if (!parse_layout_option(c, optarg, layout)) return usage_index2();
       break;
     case 'M':
       mask_type = optarg;
@@ -515,7 +528,9 @@ int ms_index2(int argc, char *argv[]) {
     return usage_index2();
   }
   const std::string index_path = index_file_name(prefix.empty() ? fn : prefix);
-  if (layout.mask < 0) layout.mask = fmsi2::default_layout().mask;
+  const fmsi2::layout default_layout = fmsi2::default_layout();
+  if (layout.bwt_block_bytes == 0) layout.bwt_block_bytes = default_layout.bwt_block_bytes;
+  if (layout.mask < 0) layout.mask = default_layout.mask;
 
   std::string header;
   auto ms = read_masked_superstring(fn, &header);
@@ -661,7 +676,7 @@ int ms_query2(int argc, char *argv[], bool output_orders) {
   bool streaming = false;
   int threads = 1;
   fmsi2::layout layout;
-  while ((c = getopt(argc, argv, "hq:k:b:p:St:m:O")) >= 0) {
+  while ((c = getopt(argc, argv, "hq:k:b:p:St:c:m:O")) >= 0) {
     switch (c) {
     case 'h':
       usage = true;
@@ -684,8 +699,9 @@ int ms_query2(int argc, char *argv[], bool output_orders) {
     case 'p':
       prefix_length = atoi(optarg);
       break;
+    case 'c':
     case 'm':
-      if (!parse_layout_option(optarg, layout)) return usage_query2(output_orders);
+      if (!parse_layout_option(c, optarg, layout)) return usage_query2(output_orders);
       break;
     case 'O':
       // The option of FMSI 1 for max-one masks: not needed, as any mask is tested.
@@ -741,7 +757,7 @@ int ms_query2(int argc, char *argv[], bool output_orders) {
             << "\tsteps_per_kmer=" << (stats.kmers ? (double)stats.steps / stats.kmers : 0)
             << "\tsearches=" << stats.searches << "\trechecks=" << stats.rechecks
             << "\tthreads=" << threads
-            << "\tmask=" << fmsi2::mask_name(index.mask_type)
+            << "\tbwt_block_bytes=" << index.bwt.block_bytes() << "\tmask=" << fmsi2::mask_name(index.mask_type)
             << "\tindex_bytes_in_memory=" << index.bytes()
             << "\tloaded_rss_kb=" << loaded_bytes / 1000 << "\tload_peak_rss_kb=" << load_peak_bytes / 1000
             << "\tend_rss_kb=" << fmsi2::resident_bytes() / 1000 << "\tpeak_rss_kb=" << fmsi2::peak_resident_bytes() / 1000

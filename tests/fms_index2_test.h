@@ -113,11 +113,13 @@ queries make_queries(std::mt19937_64 &rng, const std::string &ms, size_t k) {
     return result;
 }
 
-TEST(RANK2, QUAD_RANK) {
+template <size_t BYTES>
+void test_quad_rank() {
     std::mt19937_64 rng(1);
-    for (size_t size : {0, 1, 223, 224, 225, 4000, 57344, 57345, 130000}) {
+    const size_t block = fmsi2::quad_rank<BYTES>::BLOCK_SYMBOLS, super = block * fmsi2::quad_rank<BYTES>::SUPER_BLOCKS;
+    for (size_t size : {(size_t)0, (size_t)1, block - 1, block, block + 1, 9 * block + 5, super, super + 1, 2 * super + 77}) {
         std::vector<uint8_t> symbols(size);
-        fmsi2::quad_rank ranks(size);
+        fmsi2::quad_rank<BYTES> ranks(size);
         for (size_t i = 0; i < size; ++i) {
             symbols[i] = rng() % 4;
             ranks.set(i, symbols[i]);
@@ -126,7 +128,7 @@ TEST(RANK2, QUAD_RANK) {
         size_t counts[4] = {0, 0, 0, 0};
         for (size_t i = 0; i <= size; ++i) {
             for (int c = 0; c < 4; ++c) ASSERT_EQ(ranks.rank(i, c), counts[c]) << "size " << size << " position " << i;
-            for (size_t distance : {0, 1, 2, 30, 250}) {
+            for (size_t distance : {0, 1, 2, 30, 250, 1100}) {
                 if (i + distance > size) continue;
                 size_t rank_i, rank_j;
                 uint8_t c = rng() % 4;
@@ -140,6 +142,12 @@ TEST(RANK2, QUAD_RANK) {
             }
         }
     }
+}
+
+TEST(RANK2, QUAD_RANK) {
+    test_quad_rank<64>();
+    test_quad_rank<128>();
+    test_quad_rank<256>();
 }
 
 TEST(RANK2, BIT_RANK) {
@@ -221,7 +229,7 @@ TEST(FMS_INDEX2, MEMBERSHIP) {
         for (auto mask_type : {fmsi2::mask_kind::plain, fmsi2::mask_kind::packed, fmsi2::mask_kind::rrr}) {
             mbwt m = compute_mbwt<uint64_t>(ms, k, false);
             fmsi2::index index;
-            fmsi2::build(index, m, k, mask_type);
+            fmsi2::build(index, m, k, mask_type, 64 << (round % 3));
             for (unsigned table : {0, 2, 10}) {
                 fmsi2::build_prefix_table(index, table);
                 for (unsigned batch : {1, 3, 32}) {
@@ -253,7 +261,7 @@ TEST(FMS_INDEX2, HASHES) {
 
         mbwt m = compute_mbwt<uint64_t>(ms, k, false);
         fmsi2::index index;
-        fmsi2::build(index, m, k, (fmsi2::mask_kind)(round % 3));
+        fmsi2::build(index, m, k, (fmsi2::mask_kind)(round % 3), 64 << (round / 3 % 3));
         fmsi2::build_prefix_table(index, round % 3 * 4);
         fmsi2::lookup_stats stats;
         std::vector<int64_t> single(q.sequences.size(), -1), streamed(q.sequences.size(), -1);
@@ -290,7 +298,7 @@ TEST(FMS_INDEX2, SAVE_AND_LOAD) {
     for (auto mask_type : {fmsi2::mask_kind::plain, fmsi2::mask_kind::packed, fmsi2::mask_kind::rrr}) {
         mbwt m = compute_mbwt<uint64_t>(ms, k, false);
         fmsi2::index built, loaded;
-        fmsi2::build(built, m, k, mask_type);
+        fmsi2::build(built, m, k, mask_type, mask_type == fmsi2::mask_kind::plain ? 128 : 256);
         std::string path = testing::TempDir() + "fmsi2_test.fmsi";
         fmsi2::save(built, path);
         fmsi2::load(loaded, path);
@@ -333,28 +341,33 @@ TEST(FMS_INDEX2, FILE_LAYOUTS) {
         fmsi2::build(built, m, k, fmsi2::mask_kind::plain);
         const std::vector<int64_t> want = hashes_of(built, q);
 
-        for (int mask : {-1, 0, 1, 2}) {
-            fmsi2::layout layout;
-            layout.mask = mask;
-            fmsi2::index loaded;
-            fmsi2::load(loaded, path, 1 + (mask + 1) % 3, layout);
-            ASSERT_EQ(loaded.k, k);
-            ASSERT_EQ(loaded.size, built.size);
-            ASSERT_EQ(loaded.mask_ones, built.mask_ones);
-            ASSERT_EQ(loaded.mask_type_name, statistics.type);
-            // The recommended layout is the fastest one.
-            if (mask < 0) ASSERT_EQ(loaded.mask_type, fmsi2::mask_kind::plain);
-            for (size_t i = 0; i < loaded.size; i += 1 + rng() % 7) ASSERT_EQ(loaded.mask_get(i), built.mask_get(i)) << "row " << i;
-            ASSERT_EQ(hashes_of(loaded, q), want) << "round " << round << " mask " << mask;
+        for (uint32_t block_bytes : {0, 64, 128, 256}) {
+            for (int mask : {-1, 0, 1, 2}) {
+                fmsi2::layout layout;
+                layout.bwt_block_bytes = block_bytes;
+                layout.mask = mask;
+                fmsi2::index loaded;
+                fmsi2::load(loaded, path, 1 + (block_bytes / 64) % 3, layout);
+                ASSERT_EQ(loaded.k, k);
+                ASSERT_EQ(loaded.size, built.size);
+                ASSERT_EQ(loaded.mask_ones, built.mask_ones);
+                ASSERT_EQ(loaded.mask_type_name, statistics.type);
+                // The recommended layout is the fastest one.
+                if (block_bytes == 0) ASSERT_EQ(loaded.bwt.block_bytes(), 64u);
+                if (mask < 0) ASSERT_EQ(loaded.mask_type, fmsi2::mask_kind::plain);
+                for (size_t i = 0; i < loaded.size; i += 1 + rng() % 7) ASSERT_EQ(loaded.mask_get(i), built.mask_get(i)) << "row " << i;
+                ASSERT_EQ(hashes_of(loaded, q), want) << "round " << round << " blocks " << block_bytes << " mask " << mask;
 
-            // An index written from memory is the same file content-wise: it loads to the same index.
-            if (mask == (int)fmsi2::mask_kind::packed) {
-                fmsi2::save(loaded, path + ".again", 2);
-                fmsi2::index again;
-                fmsi2::load(again, path + ".again");
-                ASSERT_EQ(again.mask_type, fmsi2::mask_kind::packed);
-                ASSERT_EQ(hashes_of(again, q), want);
-                std::filesystem::remove(path + ".again");
+                // An index written from memory is the same file content-wise: it loads to the same index.
+                if (block_bytes == 128 && mask == (int)fmsi2::mask_kind::packed) {
+                    fmsi2::save(loaded, path + ".again", 2);
+                    fmsi2::index again;
+                    fmsi2::load(again, path + ".again");
+                    ASSERT_EQ(again.bwt.block_bytes(), 128u);
+                    ASSERT_EQ(again.mask_type, fmsi2::mask_kind::packed);
+                    ASSERT_EQ(hashes_of(again, q), want);
+                    std::filesystem::remove(path + ".again");
+                }
             }
         }
     }
@@ -641,31 +654,33 @@ TEST(INDEX_FILE, SECTIONS) {
 /// The packed bytes of a sequence of 2-bit symbols, written and read in pieces.
 TEST(RANK2, PACKED_SYMBOLS_IN_PIECES) {
     std::mt19937_64 rng(11);
-    for (size_t size : {(size_t)1, (size_t)223, (size_t)224, (size_t)225, (size_t)100003}) {
-        std::vector<uint8_t> symbols(size), bytes((size + 3) / 4, 0);
-        for (size_t i = 0; i < size; ++i) {
-            symbols[i] = rng() % 4;
-            bytes[i / 4] |= symbols[i] << (2 * (i % 4));
+    for (uint32_t block_bytes : {64, 128, 256}) {
+        for (size_t size : {(size_t)1, (size_t)223, (size_t)224, (size_t)225, (size_t)100003}) {
+            std::vector<uint8_t> symbols(size), bytes((size + 3) / 4, 0);
+            for (size_t i = 0; i < size; ++i) {
+                symbols[i] = rng() % 4;
+                bytes[i / 4] |= symbols[i] << (2 * (i % 4));
+            }
+            fmsi2::quad_sequence sequence(size, block_bytes);
+            for (size_t first = 0; first < bytes.size();) {
+                const size_t count = std::min<size_t>(bytes.size() - first, 1 + rng() % 300);
+                sequence.set_packed(first, bytes.data() + first, count);
+                first += count;
+            }
+            sequence.finalize();
+            size_t ranks[4] = {0, 0, 0, 0};
+            for (size_t i = 0; i < size; ++i) {
+                for (uint8_t c = 0; c < 4; ++c) ASSERT_EQ(sequence.rank(i, c), ranks[c]);
+                ranks[symbols[i]]++;
+            }
+            std::vector<uint8_t> back(bytes.size(), 0xFF);
+            for (size_t first = 0; first < bytes.size();) {
+                const size_t count = std::min<size_t>(bytes.size() - first, 1 + rng() % 300);
+                sequence.get_packed(first, back.data() + first, count);
+                first += count;
+            }
+            ASSERT_EQ(back, bytes);
         }
-        fmsi2::quad_rank sequence(size);
-        for (size_t first = 0; first < bytes.size();) {
-            const size_t count = std::min<size_t>(bytes.size() - first, 1 + rng() % 300);
-            sequence.set_packed(first, bytes.data() + first, count);
-            first += count;
-        }
-        sequence.finalize();
-        size_t ranks[4] = {0, 0, 0, 0};
-        for (size_t i = 0; i < size; ++i) {
-            for (uint8_t c = 0; c < 4; ++c) ASSERT_EQ(sequence.rank(i, c), ranks[c]);
-            ranks[symbols[i]]++;
-        }
-        std::vector<uint8_t> back(bytes.size(), 0xFF);
-        for (size_t first = 0; first < bytes.size();) {
-            const size_t count = std::min<size_t>(bytes.size() - first, 1 + rng() % 300);
-            sequence.get_packed(first, back.data() + first, count);
-            first += count;
-        }
-        ASSERT_EQ(back, bytes);
     }
 }
 

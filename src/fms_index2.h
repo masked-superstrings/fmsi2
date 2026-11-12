@@ -4,8 +4,8 @@
 // layout, searched in batches with prefetching.
 //
 // Differences from the original index (fms_index.h):
-//  - the BWT is stored as 2-bit symbols with in-line rank counts (one cache
-//    line per rank instead of a wavelet tree over three bitvectors),
+//  - the BWT is stored as 2-bit symbols with in-line rank counts (one block of
+//    64 to 256 bytes per rank instead of a wavelet tree over three bitvectors),
 //  - the SA-transformed mask is a plain bitvector with in-line rank counts, a
 //    Tunstall-coded bitvector (smaller, one cache line per access as well),
 //    or the original RRR vector,
@@ -41,7 +41,7 @@ struct index {
     uint64_t size = 0;
     uint64_t dollar_position = 0;
     uint64_t counts[4] = {0, 0, 0, 0};
-    quad_rank bwt;
+    quad_sequence bwt;
     mask_kind mask_type = mask_kind::plain;
     bit_rank mask;
     tunstall_bits mask_packed;
@@ -207,7 +207,7 @@ inline mask_statistics decide_mask_type(mask_statistics computed, const std::str
 }
 
 /// Build the index from the MBWT, which is consumed.
-void build(index &ix, mbwt &m, int k, mask_kind mask_type) {
+void build(index &ix, mbwt &m, int k, mask_kind mask_type, uint32_t bwt_block_bytes = 64) {
     ix.k = k;
     ix.size = m.bwt.size();
     ix.dollar_position = m.dollar_position;
@@ -215,7 +215,7 @@ void build(index &ix, mbwt &m, int k, mask_kind mask_type) {
     ix.mask_type_name = statistics.type == "unknown" ? "" : statistics.type;
     ix.mask_type_source = statistics.source;
 
-    ix.bwt = quad_rank(m.bwt.size());
+    ix.bwt = quad_sequence(m.bwt.size(), bwt_block_bytes);
     uint64_t totals[4] = {0, 0, 0, 0};
     for (size_t i = 0; i < m.bwt.size(); ++i) {
         ix.bwt.set(i, m.bwt[i]);
@@ -249,14 +249,17 @@ void build(index &ix, mbwt &m, int k, mask_kind mask_type) {
 /// The layout of an index in memory. It is chosen when the index is loaded, as the file holds the BWT and the
 /// mask in a form of its own; the file recommends one.
 struct layout {
+    /// Bytes per block of the BWT (64, 128 or 256); 0 stands for the recommended one.
+    uint32_t bwt_block_bytes = 0;
     /// Encoding of the mask (a mask_kind); -1 stands for the recommended one.
     int mask = -1;
 };
 
-/// The layout that a file recommends unless fmsi2 index is told otherwise (-m): the one that answers the
-/// fastest (the plain mask).
+/// The layout that a file recommends unless fmsi2 index is told otherwise (-c, -m): the one that answers the
+/// fastest (blocks of 64 bytes, i.e. one cache line per rank, and the plain mask).
 inline layout default_layout() {
     layout result;
+    result.bwt_block_bytes = 64;
     result.mask = (int)mask_kind::plain;
     return result;
 }
@@ -289,7 +292,7 @@ inline bool parse_mask_name(const std::string &name, mask_kind &kind) {
 ///
 /// Keys of META of an index: kind (index), creator, k, rows (the length of the BWT), dollar (the row of the
 /// sentinel), counts (the four cumulative character counts), mask_ones, mask_order (sa), layout (the recommended
-/// layout in memory: the mask encoding). Unknown keys are ignored.
+/// layout in memory: bytes per block of the BWT and the mask encoding). Unknown keys are ignored.
 static const uint32_t ENCODING_BWT_PACKED = 1;
 static const uint32_t ENCODING_MASK_SA_BITS = 1;
 static const char *const INDEX_EXTENSION = ".fmsi";
@@ -335,7 +338,7 @@ inline void write_index_file(const std::string &path, const description &d,
     if (!d.mask_type_source.empty()) meta.set("mask_type_source", d.mask_type_source);
     if (!d.superstring_header.empty()) meta.set("superstring_header", d.superstring_header);
     meta.set("mask_order", "sa");
-    meta.set("layout", mask_name((mask_kind)d.recommended.mask));
+    meta.set("layout", std::to_string(d.recommended.bwt_block_bytes) + "," + mask_name((mask_kind)d.recommended.mask));
     const std::string text = meta.text();
 
     file::writer out(path);
@@ -396,6 +399,7 @@ inline description describe(const index &ix) {
     d.dollar_position = ix.dollar_position;
     for (int c = 0; c < 4; ++c) d.counts[c] = ix.counts[c];
     d.mask_ones = ix.mask_ones;
+    d.recommended.bwt_block_bytes = ix.bwt.block_bytes();
     d.recommended.mask = (int)ix.mask_type;
     d.mask_type = ix.mask_type_name;
     d.mask_type_source = ix.mask_type_source;
@@ -450,8 +454,14 @@ inline description read_description(const file::reader &in) {
         d.counts[c] = std::stoull(item);
     }
     d.recommended = default_layout();
-    mask_kind kind;
-    if (parse_mask_name(meta.get("layout"), kind)) d.recommended.mask = (int)kind;
+    const std::string recommended = meta.get("layout");
+    const size_t comma = recommended.find(',');
+    if (comma != std::string::npos) {
+        mask_kind kind;
+        const uint32_t block_bytes = (uint32_t)std::stoul(recommended.substr(0, comma));
+        if (quad_sequence::valid_block_bytes(block_bytes)) d.recommended.bwt_block_bytes = block_bytes;
+        if (parse_mask_name(recommended.substr(comma + 1), kind)) d.recommended.mask = (int)kind;
+    }
     if (meta.get("mask_order", "sa") != "sa") {
         throw std::invalid_argument("file " + in.path() + " stores its mask in an order that this version of FMSI does not know");
     }
@@ -472,13 +482,15 @@ inline void load(index &ix, const std::string &path, unsigned threads = 1, layou
     ix.mask_type_name = d.mask_type == "unknown" ? "" : d.mask_type;
     ix.mask_type_source = d.mask_type_source;
     ix.superstring_header = d.superstring_header;
+    const uint32_t block_bytes = wanted.bwt_block_bytes ? wanted.bwt_block_bytes : d.recommended.bwt_block_bytes;
     ix.mask_type = (mask_kind)(wanted.mask >= 0 ? wanted.mask : d.recommended.mask);
+    if (!quad_sequence::valid_block_bytes(block_bytes)) throw std::invalid_argument("unsupported size of the blocks of the BWT");
 
     const file::section_entry &bwt = in.get("BWT");
     if (bwt.encoding != ENCODING_BWT_PACKED || bwt.items != d.rows || bwt.raw_bytes != (d.rows + 3) / 4) {
         throw std::invalid_argument("file " + path + " stores its BWT in a form that this version of FMSI does not know");
     }
-    ix.bwt = quad_rank(d.rows);
+    ix.bwt = quad_sequence(d.rows, block_bytes);
     in.read(bwt, threads, [&](uint64_t offset, const uint8_t *data, size_t bytes) { ix.bwt.set_packed(offset, data, bytes); });
     ix.bwt.finalize();
 
