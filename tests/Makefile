@@ -25,7 +25,7 @@ verification-test: ./verify.py
 	python3 verify.py data/GCF_009858895.2_ASM985889v3_genomic.fna.ms.k13 --k=13 --hashes=True
 
 fmsi-test: $(wildcard *.cpp *.h *.hpp) gtest-all.o $(SRC)/$(wildcard *.cpp *.h *.hpp) $(SRC)/QSufSort.c
-	$(CXX) $(CXXFLAGS) -isystem $(GTEST)/include -I $(GTEST)/include  $(INCLUDES) main.cpp $(SRC)/QSufSort.c gtest-all.o -pthread -o $@ $(LIBS)
+	$(CXX) $(CXXFLAGS) -I $(GTEST)/include $(INCLUDES) main.cpp $(SRC)/QSufSort.c gtest-all.o -pthread -o $@ $(LIBS)
 
 gtest-all.o: $(GTEST)/src/gtest-all.cc
 	$(CXX) $(CXXFLAGS) -isystem $(GTEST)/include -I $(GTEST)/include -I $(GTEST) -DGTEST_CREATE_SHARED_LIBRARY=1 -c -pthread $(GTEST)/src/gtest-all.cc -o $@
