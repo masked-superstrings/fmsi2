@@ -6,8 +6,9 @@
 // Differences from the original index (fms_index.h):
 //  - the BWT is stored as 2-bit symbols with in-line rank counts (one cache
 //    line per rank instead of a wavelet tree over three bitvectors),
-//  - the SA-transformed mask is either a plain bitvector with in-line rank
-//    counts or the original RRR vector,
+//  - the SA-transformed mask is a plain bitvector with in-line rank counts, a
+//    Tunstall-coded bitvector (smaller, one cache line per access as well),
+//    or the original RRR vector,
 //  - the SA intervals of all short patterns are tabulated when the index is loaded,
 //  - k-mers are searched in lockstep, each step prefetching the cache lines of the next one.
 
@@ -31,6 +32,7 @@ namespace fmsi2 {
 enum class mask_kind : uint32_t {
     plain = 0,
     rrr = 1,
+    packed = 2,
 };
 
 struct index {
@@ -42,6 +44,7 @@ struct index {
     quad_rank bwt;
     mask_kind mask_type = mask_kind::plain;
     bit_rank mask;
+    tunstall_bits mask_packed;
     sdsl::rrr_vector<RRR_BLOCK_SIZE> mask_rrr;
     sdsl::rank_support_rrr<1, RRR_BLOCK_SIZE> mask_rrr_rank;
 
@@ -67,19 +70,58 @@ struct index {
     index &operator=(const index &) = delete;
 
     inline bool mask_get(size_t i) const {
-        return mask_type == mask_kind::plain ? mask[i] : (bool)mask_rrr[i];
+        switch (mask_type) {
+        case mask_kind::plain:
+            return mask[i];
+        case mask_kind::packed:
+            return mask_packed[i];
+        default:
+            return mask_rrr[i];
+        }
     }
 
     inline size_t mask_rank(size_t i) const {
-        return mask_type == mask_kind::plain ? mask.rank(i) : mask_rrr_rank(i);
+        switch (mask_type) {
+        case mask_kind::plain:
+            return mask.rank(i);
+        case mask_kind::packed:
+            return mask_packed.rank(i);
+        default:
+            return mask_rrr_rank(i);
+        }
     }
 
-    inline void mask_prefetch(size_t i) const {
-        if (mask_type == mask_kind::plain) mask.prefetch(i);
+    /// Bit i, given the value returned by mask_prefetch(i).
+    inline bool mask_get(size_t i, size_t hint) const {
+        return mask_type == mask_kind::packed ? mask_packed.get(i, hint) : mask_get(i);
+    }
+
+    /// Prefetch what mask_get(i, hint) reads and return the hint.
+    inline size_t mask_prefetch(size_t i) const {
+        if (mask_type == mask_kind::plain) {
+            mask.prefetch(i);
+        } else if (mask_type == mask_kind::packed) {
+            return mask_packed.prefetch(i);
+        }
+        return 0;
+    }
+
+    /// Whether mask_prefetch() reads memory that should be prefetched itself, by mask_prefetch_directory().
+    inline bool mask_has_directory() const { return mask_type == mask_kind::packed; }
+
+    inline void mask_prefetch_directory(size_t i) const {
+        if (mask_type == mask_kind::packed) mask_packed.prefetch_directory(i);
     }
 
     size_t mask_bytes() const {
-        return mask_type == mask_kind::plain ? mask.bytes() : sdsl::size_in_bytes(mask_rrr);
+        switch (mask_type) {
+        case mask_kind::plain:
+            return mask.bytes();
+        case mask_kind::packed:
+            return mask_packed.bytes();
+        default:
+            return sdsl::size_in_bytes(mask_rrr);
+        }
     }
 };
 
@@ -194,6 +236,8 @@ void build(index &ix, mbwt &m, int k, mask_kind mask_type) {
             if (m.sa_transformed_mask[i]) ix.mask.set(i);
         }
         ix.mask.finalize();
+    } else if (mask_type == mask_kind::packed) {
+        ix.mask_packed.build(m.sa_transformed_mask.size(), [&](size_t i) { return (bool)m.sa_transformed_mask[i]; });
     } else {
         ix.mask_rrr = sdsl::rrr_vector<RRR_BLOCK_SIZE>(m.sa_transformed_mask);
         ix.mask_rrr_rank = sdsl::rank_support_rrr<1, RRR_BLOCK_SIZE>(&ix.mask_rrr);
@@ -218,12 +262,14 @@ inline layout default_layout() {
 }
 
 inline const char *mask_name(mask_kind kind) {
-    return kind == mask_kind::plain ? "plain" : "rrr";
+    return kind == mask_kind::plain ? "plain" : kind == mask_kind::packed ? "packed" : "rrr";
 }
 
 inline bool parse_mask_name(const std::string &name, mask_kind &kind) {
     if (name == "plain") {
         kind = mask_kind::plain;
+    } else if (name == "packed") {
+        kind = mask_kind::packed;
     } else if (name == "rrr") {
         kind = mask_kind::rrr;
     } else {
@@ -446,6 +492,12 @@ inline void load(index &ix, const std::string &path, unsigned threads = 1, layou
             for_each_word(offset, data, bytes, d.rows, [&](uint64_t first, uint64_t word, unsigned count) { ix.mask.set_bits(first, word, count); });
         });
         ix.mask.finalize();
+    } else if (ix.mask_type == mask_kind::packed) {
+        ix.mask_packed.build_stream(d.rows, d.mask_ones, [&](auto sink) {
+            in.read(mask, threads, [&](uint64_t offset, const uint8_t *data, size_t bytes) {
+                for_each_word(offset, data, bytes, d.rows, [&](uint64_t, uint64_t word, unsigned count) { sink(word, count); });
+            });
+        });
     } else {
         sdsl::bit_vector bits(d.rows, 0);
         in.read(mask, threads, [&](uint64_t offset, const uint8_t *data, size_t bytes) {
@@ -517,9 +569,11 @@ void lookup_batch(const index &ix, const char *sequence, const uint32_t *offsets
     const unsigned p = ix.prefix_length;
     const uint64_t *table = ix.prefix_table.data();
 
-    enum : uint8_t { IDLE, START, SEARCH, MASK };
+    enum : uint8_t { IDLE, START, SEARCH, LOCATE_MASK, MASK };
     struct slot {
         size_t i, j;
+        /// The value returned by mask_prefetch(i).
+        size_t hint;
         const char *kmer;
         uint64_t key;
         uint32_t offset;
@@ -576,12 +630,17 @@ void lookup_batch(const index &ix, const char *sequence, const uint32_t *offsets
             begin_strand(s);
         }
     };
+    const bool mask_has_directory = ix.mask_has_directory();
     auto advance = [&](slot &s) {
         if (s.i == s.j) {
             strand_failed(s);
+        } else if (s.t == k && mask_has_directory) {
+            // The directory of the mask is hardly in the cache after a whole search.
+            s.state = LOCATE_MASK;
+            ix.mask_prefetch_directory(s.i);
         } else if (s.t == k) {
             s.state = MASK;
-            ix.mask_prefetch(s.i);
+            s.hint = ix.mask_prefetch(s.i);
         } else {
             s.state = SEARCH;
             ix.bwt.prefetch(s.i);
@@ -608,9 +667,13 @@ void lookup_batch(const index &ix, const char *sequence, const uint32_t *offsets
                 advance(s);
                 break;
             }
+            case LOCATE_MASK:
+                s.state = MASK;
+                s.hint = ix.mask_prefetch(s.i);
+                break;
             case MASK: {
-                bool represented = false;
-                for (size_t q = s.i; q < s.j && !represented; ++q) represented = ix.mask_get(q);
+                bool represented = ix.mask_get(s.i, s.hint);
+                for (size_t q = s.i + 1; q < s.j && !represented; ++q) represented = ix.mask_get(q);
                 if (represented) {
                     out[s.offset] = hashes ? (out_t)ix.mask_rank(s.i) : (out_t)1;
                     ++found;
@@ -665,6 +728,8 @@ void lookup_streaming(const index &ix, const char *sequence, const segment *segm
     enum : uint8_t { IDLE, START, SEARCH, CHECK };
     struct slot {
         size_t i, j;
+        /// The value returned by mask_prefetch(i).
+        size_t hint;
         const char *sequence;
         /// Results of the windows of the segment.
         out_t *out;
@@ -801,7 +866,7 @@ void lookup_streaming(const index &ix, const char *sequence, const segment *segm
     };
     auto to_check = [&](slot &s) {
         s.state = CHECK;
-        ix.mask_prefetch(s.i);
+        s.hint = ix.mask_prefetch(s.i);
         ix.bwt.prefetch(s.i);
         ix.bwt.prefetch(s.j);
     };
@@ -820,7 +885,10 @@ void lookup_streaming(const index &ix, const char *sequence, const segment *segm
     // The interval is the one of a string starting with window x: resolve the window and go to the next one.
     auto check = [&](slot &s) {
         size_t q = s.i;
-        while (q < s.j && !ix.mask_get(q)) ++q;
+        if (!ix.mask_get(q, s.hint)) {
+            ++q;
+            while (q < s.j && !ix.mask_get(q)) ++q;
+        }
         if (q < s.j) {
             result(s, s.x) = hashes ? (out_t)ix.mask_rank(q) : (out_t)1;
             ++found;

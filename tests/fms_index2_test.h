@@ -163,6 +163,38 @@ TEST(RANK2, BIT_RANK) {
     }
 }
 
+TEST(RANK2, TUNSTALL_BITS) {
+    std::mt19937_64 rng(7);
+    for (double density : {0.0, 0.003, 0.228, 0.5, 0.772, 0.97, 1.0}) {
+        for (size_t size : {0, 1, 2, 100, 594, 5000, 150000}) {
+            std::vector<bool> bits(size);
+            for (size_t i = 0; i < size; ++i) bits[i] = (rng() >> 11) * (1.0 / (1ULL << 53)) < density;
+            fmsi2::tunstall_bits ranks;
+            ranks.build(size, [&](size_t i) { return (bool)bits[i]; });
+            size_t ones = 0;
+            for (size_t i = 0; i <= size; ++i) {
+                ASSERT_EQ(ranks.rank(i), ones) << "density " << density << " size " << size << " position " << i;
+                if (i < size) {
+                    ASSERT_EQ(ranks[i], bits[i]) << "density " << density << " size " << size << " position " << i;
+                    ones += bits[i];
+                }
+            }
+        }
+    }
+    // Runs, which the code is not made for, must still be decoded right.
+    size_t size = 100000;
+    std::vector<bool> bits(size);
+    for (size_t i = 0; i < size; ++i) bits[i] = (i / 3000) % 2;
+    fmsi2::tunstall_bits ranks;
+    ranks.build(size, [&](size_t i) { return (bool)bits[i]; });
+    size_t ones = 0;
+    for (size_t i = 0; i < size; ++i) {
+        ASSERT_EQ(ranks.rank(i), ones);
+        ASSERT_EQ(ranks[i], bits[i]);
+        ones += bits[i];
+    }
+}
+
 TEST(FMS_INDEX2, MATCHES_SUFFIX_ARRAY_CONSTRUCTIONS) {
     std::mt19937_64 rng(3);
     for (int round = 0; round < 20; ++round) {
@@ -186,7 +218,7 @@ TEST(FMS_INDEX2, MEMBERSHIP) {
         auto represented = represented_kmers(ms, k);
         queries q = make_queries(rng, ms, k);
 
-        for (auto mask_type : {fmsi2::mask_kind::plain, fmsi2::mask_kind::rrr}) {
+        for (auto mask_type : {fmsi2::mask_kind::plain, fmsi2::mask_kind::packed, fmsi2::mask_kind::rrr}) {
             mbwt m = compute_mbwt<uint64_t>(ms, k, false);
             fmsi2::index index;
             fmsi2::build(index, m, k, mask_type);
@@ -221,7 +253,7 @@ TEST(FMS_INDEX2, HASHES) {
 
         mbwt m = compute_mbwt<uint64_t>(ms, k, false);
         fmsi2::index index;
-        fmsi2::build(index, m, k, round % 2 ? fmsi2::mask_kind::plain : fmsi2::mask_kind::rrr);
+        fmsi2::build(index, m, k, (fmsi2::mask_kind)(round % 3));
         fmsi2::build_prefix_table(index, round % 3 * 4);
         fmsi2::lookup_stats stats;
         std::vector<int64_t> single(q.sequences.size(), -1), streamed(q.sequences.size(), -1);
@@ -255,7 +287,7 @@ TEST(FMS_INDEX2, SAVE_AND_LOAD) {
     size_t k = 13;
     std::string ms = random_mask(rng, random_superstring(rng, 3000), k, true);
     queries q = make_queries(rng, ms, k);
-    for (auto mask_type : {fmsi2::mask_kind::plain, fmsi2::mask_kind::rrr}) {
+    for (auto mask_type : {fmsi2::mask_kind::plain, fmsi2::mask_kind::packed, fmsi2::mask_kind::rrr}) {
         mbwt m = compute_mbwt<uint64_t>(ms, k, false);
         fmsi2::index built, loaded;
         fmsi2::build(built, m, k, mask_type);
@@ -301,7 +333,7 @@ TEST(FMS_INDEX2, FILE_LAYOUTS) {
         fmsi2::build(built, m, k, fmsi2::mask_kind::plain);
         const std::vector<int64_t> want = hashes_of(built, q);
 
-        for (int mask : {-1, 0, 1}) {
+        for (int mask : {-1, 0, 1, 2}) {
             fmsi2::layout layout;
             layout.mask = mask;
             fmsi2::index loaded;
@@ -316,11 +348,11 @@ TEST(FMS_INDEX2, FILE_LAYOUTS) {
             ASSERT_EQ(hashes_of(loaded, q), want) << "round " << round << " mask " << mask;
 
             // An index written from memory is the same file content-wise: it loads to the same index.
-            if (mask == (int)fmsi2::mask_kind::rrr) {
+            if (mask == (int)fmsi2::mask_kind::packed) {
                 fmsi2::save(loaded, path + ".again", 2);
                 fmsi2::index again;
                 fmsi2::load(again, path + ".again");
-                ASSERT_EQ(again.mask_type, fmsi2::mask_kind::rrr);
+                ASSERT_EQ(again.mask_type, fmsi2::mask_kind::packed);
                 ASSERT_EQ(hashes_of(again, q), want);
                 std::filesystem::remove(path + ".again");
             }
@@ -501,6 +533,42 @@ TEST(FMS_INDEX2, MASK_TYPE) {
     ASSERT_EQ(header_field(header, "mode"), "bidirectional");
     ASSERT_EQ(header_field(header, "ask"), "");
     ASSERT_EQ(header_field("k=13", "k"), "13");
+}
+
+/// The Tunstall-coded bits built from a stream of words, for densities from sparse to dense.
+TEST(RANK2, PACKED_BITS_FROM_STREAM) {
+    std::mt19937_64 rng(10);
+    for (double density : {0.0, 0.001, 0.05, 0.3, 0.5, 0.77, 0.96, 0.999, 1.0}) {
+        for (size_t size : {(size_t)0, (size_t)1, (size_t)63, (size_t)64, (size_t)65, (size_t)1000, (size_t)70001, (size_t)300000}) {
+            std::vector<bool> bits(size);
+            size_t ones = 0;
+            for (size_t i = 0; i < size; ++i) {
+                bits[i] = (rng() % 1000000) < density * 1000000;
+                ones += bits[i];
+            }
+            fmsi2::tunstall_bits packed;
+            // Groups of 1 to 64 bits.
+            packed.build_stream(size, ones, [&](auto sink) {
+                for (size_t i = 0; i < size;) {
+                    const unsigned count = (unsigned)std::min<size_t>(size - i, i % 3 == 0 ? 64 : 1 + (i * 7) % 64);
+                    uint64_t word = 0;
+                    for (unsigned t = 0; t < count; ++t) word |= (uint64_t)bits[i + t] << t;
+                    sink(word, count);
+                    i += count;
+                }
+            });
+            ASSERT_EQ(packed.size(), size);
+            size_t rank = 0;
+            for (size_t i = 0; i < size; ++i) {
+                if (i % 17 == 0 || size < 2000) {
+                    ASSERT_EQ(packed.rank(i), rank) << "density " << density << " size " << size << " position " << i;
+                    ASSERT_EQ(packed[i], bits[i]) << "density " << density << " size " << size << " position " << i;
+                }
+                rank += bits[i];
+            }
+            ASSERT_EQ(packed.rank(size), ones);
+        }
+    }
 }
 
 /// The container of the index files: sections written and read back, stored as they are and compressed, and the

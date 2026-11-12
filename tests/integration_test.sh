@@ -46,7 +46,7 @@ $PROG index -k 3 -o $BIN/a2 $TESTS/integration_a.fa 2> /dev/null || exit 1
 [ -f $BIN/a2.fmsi ] || exit 1
 $PROG info --check $BIN/a2.fmsi > $BIN/a2.info || exit 1
 grep -q "^k	3$" $BIN/a2.info || exit 1
-for layout in "" "-m plain" "-m rrr"; do
+for layout in "" "-m plain" "-m packed" "-m rrr"; do
   for streaming in "" "-S"; do
     $PROG query $layout $streaming -q $TESTS/queries.txt $BIN/a2.fmsi > $BIN/a2.txt 2> /dev/null || exit 1
     diff $TESTS/result_a_complements.txt $BIN/a2.txt || exit 1

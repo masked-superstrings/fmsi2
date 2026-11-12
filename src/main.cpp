@@ -409,7 +409,7 @@ static int usage_index2() {
   std::cerr << "    -k INT  - size of k-mers [default: number of trailing masked-out characters + 1]" << std::endl << std::endl;
   std::cerr << "Advanced:" << std::endl;
   std::cerr << "    -m STR  - layout in memory recommended by the file, which fmsi2 query -m overrides: the encoding of" << std::endl;
-  std::cerr << "              the mask, plain (fast) or rrr (small, slow) [default: plain]" << std::endl;
+  std::cerr << "              the mask, plain (the fastest), packed (smaller) or rrr (slow) [default: plain]" << std::endl;
   std::cerr << "    -M STR  - the type of the mask: min-one (every k-mer set once: lookup gives a minimal perfect hash)," << std::endl;
   std::cerr << "              max-one (every occurrence of a k-mer of the set is set), or auto: as the header of the masked" << std::endl;
   std::cerr << "              superstring states it (mask=min-one, as KmerCamel writes), else as computed [default: auto];" << std::endl;
@@ -435,7 +435,7 @@ static int usage_query2(bool lookup) {
   std::cerr << "            (for reads and longer sequences)" << std::endl;
   std::cerr << "  -t INT  - number of threads [default: 1]" << std::endl << std::endl;
   std::cerr << "Advanced:" << std::endl;
-  std::cerr << "  -m STR  - encoding of the mask in memory: plain (fast) or rrr (small, slow)" << std::endl;
+  std::cerr << "  -m STR  - encoding of the mask in memory: plain (the fastest), packed (smaller) or rrr (slow)" << std::endl;
   std::cerr << "            [default: as the index file recommends]" << std::endl;
   std::cerr << "  -b INT  - number of k-mers (or sequences if -S) searched at the same time; 1 turns batching off [default: 32]" << std::endl;
   std::cerr << "  -p INT  - length of the patterns with tabulated SA intervals; 0 turns the table off [default: 10]" << std::endl;
