@@ -52,6 +52,13 @@ struct index {
     /// The number of set bits of the mask, i.e., of hashes; computed when the index is built or loaded.
     uint64_t mask_ones = 0;
 
+    /// The type of the mask as the index file states it: "min-one" (every k-mer of the set has one set
+    /// occurrence, so that lookup is a minimal perfect hash), "max-one" (all occurrences of the k-mers of the
+    /// set are set), "min-one,max-one", "other", or "" if unknown; and how it is known ("computed", "declared").
+    std::string mask_type_name, mask_type_source;
+    /// The FASTA header of the masked superstring that was indexed, if the index file has it.
+    std::string superstring_header;
+
     /// Bytes of the index in memory: the BWT, the mask and the table of patterns.
     size_t bytes() const { return bwt.bytes() + mask_bytes() + prefix_table.size() * 8; }
 
@@ -86,11 +93,85 @@ inline void update_range(const index &ix, size_t &i, size_t &j, byte c) {
     j = count + rank_j - (c == 0 && j > ix.dollar_position);
 }
 
+/// The type of a mask. FMSI answers membership queries the fastest on a max-one mask (all occurrences of the
+/// k-mers of the set are set, so the first bit of an interval decides) and dictionary queries on a min-one mask
+/// (one set occurrence per k-mer, so the rank of the interval is a minimal perfect hash). FMSI 2 tests any mask
+/// so the type matters for the hashes only: with a mask other than min-one they stay unique
+/// per set occurrence, but a k-mer set several times has several, and their range exceeds the number of k-mers.
+///
+/// The type is computed from the rows that start with the same k-mer (mbwt::same_kmer). A k-mer and its reverse
+/// complement are not related to each other there: a mask found min-one may still set a k-mer once in each
+/// orientation (masks of KmerCamel in its bidirectional mode never do). The type that the producer of the masked
+/// superstring states in its FASTA header (mask=min-one) or the user gives is therefore preferred, and what is
+/// computed checks it.
+struct mask_statistics {
+    /// "min-one", "max-one", "min-one,max-one" (each k-mer of the set occurs once), "other" or "unknown".
+    std::string type = "unknown";
+    /// "computed-one-strand", "header" (of the masked superstring), "declared" (by the user), or empty.
+    std::string source;
+    /// Whether the type was computed, and what was found: no k-mer with several set occurrences; no k-mer of
+    /// the set with an unset occurrence.
+    bool computed = false, single = false, uniform = false;
+    /// Number of different k-mers of the text with a set occurrence (computed only).
+    uint64_t kmers = 0;
+    /// Set if a stated type contradicts what was computed.
+    std::string warning;
+};
+
+/// The type of the mask computed from the MBWT (needs mbwt::same_kmer; "unknown" without it).
+inline mask_statistics classify_mask(const mbwt &m) {
+    mask_statistics result;
+    if (m.bwt.empty() || m.same_kmer.size() != m.bwt.size()) return result;
+    bool single = true, uniform = true;
+    uint64_t ones = 0, length = 0;
+    const size_t rows = m.bwt.size();
+    for (size_t i = 0; i < rows; ++i) {
+        ones += m.sa_transformed_mask[i];
+        ++length;
+        if (!m.same_kmer[i]) {
+            if (ones > 0) {
+                ++result.kmers;
+                single = single && ones == 1;
+                uniform = uniform && ones == length;
+            }
+            ones = length = 0;
+        }
+    }
+    result.computed = true;
+    result.single = single;
+    result.uniform = uniform;
+    result.type = single && uniform ? "min-one,max-one" : single ? "min-one" : uniform ? "max-one" : "other";
+    result.source = "computed-one-strand";
+    return result;
+}
+
+/// The type of the mask given what was computed and what was stated: by the user ([declared]: "min-one",
+/// "max-one", or "auto" for nothing) or in the header of the masked superstring ([header_type], may be empty).
+/// A stated type is kept unless the computed one contradicts it.
+inline mask_statistics decide_mask_type(mask_statistics computed, const std::string &declared, const std::string &header_type) {
+    const bool by_user = declared == "min-one" || declared == "max-one";
+    const bool by_header = !by_user && (header_type == "min-one" || header_type == "max-one");
+    if (!by_user && !by_header) return computed;
+    const std::string stated = by_user ? declared : header_type;
+    if (computed.computed && ((stated == "min-one" && !computed.single) || (stated == "max-one" && !computed.uniform))) {
+        computed.warning = "the mask is stated to be " + stated + (by_user ? " (-M)" : " (in the header of the masked superstring)") +
+                           ", but it is not: " + (stated == "min-one" ? "a k-mer has several set occurrences" : "a k-mer of the set has an unset occurrence") +
+                           "; its type is recorded as " + computed.type;
+        return computed;
+    }
+    computed.type = stated;
+    computed.source = by_user ? "declared" : "header";
+    return computed;
+}
+
 /// Build the index from the MBWT, which is consumed.
 void build(index &ix, mbwt &m, int k, mask_kind mask_type) {
     ix.k = k;
     ix.size = m.bwt.size();
     ix.dollar_position = m.dollar_position;
+    const mask_statistics statistics = classify_mask(m);
+    ix.mask_type_name = statistics.type == "unknown" ? "" : statistics.type;
+    ix.mask_type_source = statistics.source;
 
     ix.bwt = quad_rank(m.bwt.size());
     uint64_t totals[4] = {0, 0, 0, 0};
@@ -184,6 +265,8 @@ struct description {
     uint64_t counts[4] = {0, 0, 0, 0};
     uint64_t mask_ones = 0;
     layout recommended;
+    /// The type of the mask and how it is known (mask_statistics), and the FASTA header of the masked superstring.
+    std::string mask_type, mask_type_source, superstring_header;
 };
 
 inline std::string creator() { return std::string("fmsi2 ") + VERSION; }
@@ -202,6 +285,9 @@ inline void write_index_file(const std::string &path, const description &d,
     meta.set("counts", std::to_string(d.counts[0]) + "," + std::to_string(d.counts[1]) + "," + std::to_string(d.counts[2]) +
                            "," + std::to_string(d.counts[3]));
     meta.set("mask_ones", d.mask_ones);
+    meta.set("mask_type", d.mask_type.empty() ? "unknown" : d.mask_type);
+    if (!d.mask_type_source.empty()) meta.set("mask_type_source", d.mask_type_source);
+    if (!d.superstring_header.empty()) meta.set("superstring_header", d.superstring_header);
     meta.set("mask_order", "sa");
     meta.set("layout", mask_name((mask_kind)d.recommended.mask));
     const std::string text = meta.text();
@@ -223,12 +309,18 @@ inline void bit_vector_bytes(const sdsl::bit_vector &bits, uint64_t begin, uint6
 }
 
 /// Write the index of an MBWT to a file, without building the index in memory. Returns its description.
-inline description save_mbwt(const mbwt &m, int k, layout recommended, const std::string &path, unsigned threads = 1) {
+inline description save_mbwt(const mbwt &m, int k, layout recommended, const mask_statistics &statistics,
+                             const std::string &path, unsigned threads = 1, const std::string &superstring_header = "") {
     description d;
     d.k = k;
     d.rows = m.bwt.size();
     d.dollar_position = m.dollar_position;
     d.recommended = recommended;
+    d.mask_type = statistics.type;
+    d.mask_type_source = statistics.source;
+    // One line of the metadata.
+    d.superstring_header = superstring_header;
+    std::replace(d.superstring_header.begin(), d.superstring_header.end(), '\n', ' ');
     uint64_t totals[4] = {0, 0, 0, 0};
     for (size_t i = 0; i < m.bwt.size(); ++i) totals[m.bwt[i]]++;
     // The count of A includes the sentinel, which stands for the smallest suffix.
@@ -259,6 +351,9 @@ inline description describe(const index &ix) {
     for (int c = 0; c < 4; ++c) d.counts[c] = ix.counts[c];
     d.mask_ones = ix.mask_ones;
     d.recommended.mask = (int)ix.mask_type;
+    d.mask_type = ix.mask_type_name;
+    d.mask_type_source = ix.mask_type_source;
+    d.superstring_header = ix.superstring_header;
     return d;
 }
 
@@ -299,6 +394,9 @@ inline description read_description(const file::reader &in) {
     d.rows = meta.number("rows");
     d.dollar_position = meta.number("dollar");
     d.mask_ones = meta.number("mask_ones");
+    d.mask_type = meta.get("mask_type", "unknown");
+    d.mask_type_source = meta.get("mask_type_source");
+    d.superstring_header = meta.get("superstring_header");
     std::istringstream counts(meta.get("counts"));
     std::string item;
     for (int c = 0; c < 4; ++c) {
@@ -325,6 +423,9 @@ inline void load(index &ix, const std::string &path, unsigned threads = 1, layou
     ix.size = d.rows;
     ix.dollar_position = d.dollar_position;
     for (int c = 0; c < 4; ++c) ix.counts[c] = d.counts[c];
+    ix.mask_type_name = d.mask_type == "unknown" ? "" : d.mask_type;
+    ix.mask_type_source = d.mask_type_source;
+    ix.superstring_header = d.superstring_header;
     ix.mask_type = (mask_kind)(wanted.mask >= 0 ? wanted.mask : d.recommended.mask);
 
     const file::section_entry &bwt = in.get("BWT");

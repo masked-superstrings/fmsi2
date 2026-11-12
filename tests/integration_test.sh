@@ -60,6 +60,11 @@ echo "FMSI 2 membership OK"
 # Dictionary queries: the hashes are those of FMSI 1.
 $PROG lookup -q $TESTS/queries.txt $BIN/a2.fmsi > $BIN/a2_hash.txt 2> /dev/null || exit 1
 diff $TESTS/result_a_complements_hash.txt $BIN/a2_hash.txt || exit 1
+# The type of a min-one mask is found out and recorded.
+MINONE=data/GCF_test2_ones.fna.ms.k31
+$PROG index -o $BIN/minone $MINONE 2> /dev/null || exit 1
+$PROG info $BIN/minone.fmsi > $BIN/minone.info || exit 1
+grep -q "^mask_type	min-one" $BIN/minone.info || exit 1
 echo "FMSI 2 dictionary OK"
 
 echo "All tests passed"

@@ -401,8 +401,22 @@ struct mbwt {
     std::vector<byte> bwt;
     sdsl::bit_vector sa_transformed_mask;
     sdsl::bit_vector klcp;
+    /// Optional, for finding out the type of the mask (mbwt_with_same_kmer): bit i is set iff the suffixes of
+    /// the rows i and i + 1 start with the same k-mer.
+    sdsl::bit_vector same_kmer;
     size_t dollar_position = 0;
 };
+
+/// Whether the constructions of the MBWT also fill mbwt::same_kmer (one more bit per row while constructing).
+inline bool mbwt_with_same_kmer = false;
+
+/// Whether two strings of k letters are the same, whatever their case.
+inline bool same_letters(const char *a, const char *b, size_t k) {
+    for (size_t t = 0; t < k; ++t) {
+        if ((a[t] ^ b[t]) & 0xDF) return false;
+    }
+    return true;
+}
 
 /// Suffix array of the superstring, including the empty suffix, by QSufSort (16 bytes per character).
 std::vector<qsint_t> suffix_array_qsufsort(const std::string &ms) {
@@ -444,9 +458,17 @@ mbwt mbwt_from_suffix_array(std::string &ms, const sa_t *sa, int k, bool use_klc
     }
 
     result.sa_transformed_mask = sdsl::bit_vector(ms.size() + 1);
+    if (mbwt_with_same_kmer) result.same_kmer = sdsl::bit_vector(ms.size() + 1, 0);
     result.bwt.resize(ms.size() + 1);
-    for (size_t i = 0; i <= ms.size(); ++i) {
+    const size_t n = ms.size(), length = (size_t)k;
+    for (size_t i = 0; i <= n; ++i) {
         size_t sa_i = sa[i];
+        if (mbwt_with_same_kmer && i < n) {
+            const size_t next = sa[i + 1];
+            if (sa_i + length <= n && next + length <= n && same_letters(ms.data() + sa_i, ms.data() + next, length)) {
+                result.same_kmer[i] = 1;
+            }
+        }
         if (sa_i == 0) {
             result.dollar_position = i;
         } else {

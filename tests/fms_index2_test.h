@@ -292,8 +292,11 @@ TEST(FMS_INDEX2, FILE_LAYOUTS) {
         size_t k = std::vector<size_t>{3, 13, 31, 33}[round % 4];
         std::string ms = random_mask(rng, random_superstring(rng, k + 100 + rng() % 70000), k, round % 2);
         queries q = make_queries(rng, ms, k);
+        mbwt_with_same_kmer = true;
         mbwt m = compute_mbwt<uint64_t>(ms, k, false);
-        fmsi2::save_mbwt(m, k, fmsi2::default_layout(), path, 1 + round % 3);
+        mbwt_with_same_kmer = false;
+        const fmsi2::mask_statistics statistics = fmsi2::classify_mask(m);
+        fmsi2::save_mbwt(m, k, fmsi2::default_layout(), statistics, path, 1 + round % 3);
         fmsi2::index built;
         fmsi2::build(built, m, k, fmsi2::mask_kind::plain);
         const std::vector<int64_t> want = hashes_of(built, q);
@@ -306,6 +309,7 @@ TEST(FMS_INDEX2, FILE_LAYOUTS) {
             ASSERT_EQ(loaded.k, k);
             ASSERT_EQ(loaded.size, built.size);
             ASSERT_EQ(loaded.mask_ones, built.mask_ones);
+            ASSERT_EQ(loaded.mask_type_name, statistics.type);
             // The recommended layout is the fastest one.
             if (mask < 0) ASSERT_EQ(loaded.mask_type, fmsi2::mask_kind::plain);
             for (size_t i = 0; i < loaded.size; i += 1 + rng() % 7) ASSERT_EQ(loaded.mask_get(i), built.mask_get(i)) << "row " << i;
@@ -333,10 +337,11 @@ TEST(FMS_INDEX2, FILE_SECTIONS) {
     queries q = make_queries(rng, ms, k);
     mbwt m = compute_mbwt<uint64_t>(ms, k, false);
     const std::string path = testing::TempDir() + "fmsi2_sections_test.fmsi";
-    fmsi2::save_mbwt(m, k, fmsi2::default_layout(), path);
+    fmsi2::save_mbwt(m, k, fmsi2::default_layout(), fmsi2::mask_statistics(), path);
     fmsi2::index reference;
     fmsi2::load(reference, path);
     const std::vector<int64_t> want = hashes_of(reference, q);
+    ASSERT_EQ(reference.mask_type_name, "");
 
     // Copy the file section by section and add one that no reader knows.
     auto copy_with = [&](uint32_t flags) {
@@ -404,6 +409,98 @@ TEST(FMS_INDEX2, FILE_SECTIONS) {
     }
     std::filesystem::remove(path + ".bad");
     std::filesystem::remove(path);
+}
+
+/// The type of the mask that the constructions compute, against its definition.
+TEST(FMS_INDEX2, MASK_TYPE) {
+    std::mt19937_64 rng(9);
+    auto computed = [&](const std::string &ms, size_t k) {
+        mbwt_with_same_kmer = true;
+        std::string copy = ms;
+        mbwt m = compute_mbwt<uint64_t>(copy, k, false);
+        mbwt_with_same_kmer = false;
+        return fmsi2::classify_mask(m);
+    };
+    // By the definition: the occurrences and the set occurrences of every k-mer.
+    auto defined = [&](const std::string &ms, size_t k) {
+        std::map<std::string, std::pair<size_t, size_t>> seen;
+        for (size_t i = 0; i + k <= ms.size(); ++i) {
+            std::string kmer = ms.substr(i, k);
+            for (auto &c : kmer) c = toupper(c);
+            auto &entry = seen[kmer];
+            entry.first++;
+            entry.second += is_upper(ms[i]);
+        }
+        bool single = true, uniform = true;
+        size_t kmers = 0;
+        for (const auto &item : seen) {
+            if (item.second.second == 0) continue;
+            ++kmers;
+            single = single && item.second.second == 1;
+            uniform = uniform && item.second.second == item.second.first;
+        }
+        return std::make_pair(std::string(single && uniform ? "min-one,max-one" : single ? "min-one" : uniform ? "max-one" : "other"), kmers);
+    };
+    std::map<std::string, int> seen_types;
+    for (int round = 0; round < 200; ++round) {
+        size_t k = std::vector<size_t>{2, 3, 5, 13, 31}[rng() % 5];
+        std::string s = round % 5 == 4 ? random_dna(rng, k + rng() % 300) : random_superstring(rng, k + rng() % 600);
+        std::string ms;
+        switch (round % 4) {
+        case 0:
+            ms = random_mask(rng, s, k, true);
+            break;
+        case 1:
+            ms = random_mask(rng, s, k, false);
+            break;
+        default: {
+            // A max-one mask: a random set of canonical k-mers, all of whose occurrences are set.
+            std::set<std::string> chosen;
+            ms = s;
+            for (auto &c : ms) c = tolower(c);
+            for (size_t i = 0; i + k <= s.size(); ++i) {
+                if (rng() % 2) chosen.insert(canonical(s.substr(i, k)));
+            }
+            for (size_t i = 0; i + k <= s.size(); ++i) {
+                if (chosen.count(canonical(s.substr(i, k)))) ms[i] = toupper(ms[i]);
+            }
+            break;
+        }
+        }
+        const fmsi2::mask_statistics got = computed(ms, k);
+        const auto want = defined(ms, k);
+        ASSERT_EQ(got.source, "computed-one-strand");
+        ASSERT_EQ(got.type, want.first) << ms << " k " << k;
+        // A stated type is kept if the mask does not contradict it, and replaced with a warning if it does.
+        for (const std::string stated : {"min-one", "max-one"}) {
+            const fmsi2::mask_statistics by_header = fmsi2::decide_mask_type(got, "auto", stated);
+            const fmsi2::mask_statistics by_user = fmsi2::decide_mask_type(got, stated, stated == "min-one" ? "max-one" : "");
+            const bool holds = stated == "min-one" ? got.single : got.uniform;
+            ASSERT_EQ(by_header.warning.empty(), holds);
+            ASSERT_EQ(by_header.source, holds ? "header" : got.source);
+            ASSERT_EQ(by_user.source, holds ? "declared" : got.source);
+            ASSERT_EQ(by_header.type, holds ? stated : got.type);
+            ASSERT_EQ(by_user.type, holds ? stated : got.type);
+        }
+        ASSERT_EQ(got.kmers, want.second) << ms;
+        seen_types[got.type]++;
+    }
+    // All four types occurred.
+    ASSERT_EQ(seen_types.size(), 4u);
+    // Without the rows of the same k-mers nothing is computed, and a stated type is taken as it is.
+    mbwt none;
+    ASSERT_EQ(fmsi2::classify_mask(none).type, "unknown");
+    ASSERT_EQ(fmsi2::decide_mask_type(fmsi2::classify_mask(none), "max-one", "min-one").type, "max-one");
+    ASSERT_EQ(fmsi2::decide_mask_type(fmsi2::classify_mask(none), "max-one", "min-one").source, "declared");
+    ASSERT_EQ(fmsi2::decide_mask_type(fmsi2::classify_mask(none), "auto", "min-one").source, "header");
+    ASSERT_EQ(fmsi2::decide_mask_type(fmsi2::classify_mask(none), "auto", "").type, "unknown");
+    // Fields of a FASTA header, as KmerCamel writes them.
+    const std::string header = "maskedsuperstring dataset='a b.fa' k=31 alg=greedy mask=min-one mode=bidirectional";
+    ASSERT_EQ(header_field(header, "mask"), "min-one");
+    ASSERT_EQ(header_field(header, "k"), "31");
+    ASSERT_EQ(header_field(header, "mode"), "bidirectional");
+    ASSERT_EQ(header_field(header, "ask"), "");
+    ASSERT_EQ(header_field("k=13", "k"), "13");
 }
 
 /// The container of the index files: sections written and read back, stored as they are and compressed, and the

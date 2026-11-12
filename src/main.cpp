@@ -410,6 +410,10 @@ static int usage_index2() {
   std::cerr << "Advanced:" << std::endl;
   std::cerr << "    -m STR  - layout in memory recommended by the file, which fmsi2 query -m overrides: the encoding of" << std::endl;
   std::cerr << "              the mask, plain (fast) or rrr (small, slow) [default: plain]" << std::endl;
+  std::cerr << "    -M STR  - the type of the mask: min-one (every k-mer set once: lookup gives a minimal perfect hash)," << std::endl;
+  std::cerr << "              max-one (every occurrence of a k-mer of the set is set), or auto: as the header of the masked" << std::endl;
+  std::cerr << "              superstring states it (mask=min-one, as KmerCamel writes), else as computed [default: auto];" << std::endl;
+  std::cerr << "              a stated type that the mask contradicts is replaced by the computed one, with a warning" << std::endl;
   std::cerr << "    -Q      - construct the suffix array by QSufSort instead of libsais" << std::endl << std::endl;
   return 1;
 }
@@ -474,7 +478,8 @@ int ms_index2(int argc, char *argv[]) {
   std::string prefix;
   // The layout in memory that the file recommends: the fastest one unless -m is given.
   fmsi2::layout layout;
-  while ((c = getopt(argc, argv, "hk:m:o:Q")) >= 0) {
+  std::string mask_type = "auto";
+  while ((c = getopt(argc, argv, "hk:m:o:QM:")) >= 0) {
     switch (c) {
     case 'h':
       usage = true;
@@ -484,6 +489,13 @@ int ms_index2(int argc, char *argv[]) {
       break;
     case 'm':
       if (!parse_layout_option(optarg, layout)) return usage_index2();
+      break;
+    case 'M':
+      mask_type = optarg;
+      if (mask_type != "auto" && mask_type != "min-one" && mask_type != "max-one") {
+        std::cerr << "ERROR: The type of the mask is min-one, max-one or auto." << std::endl;
+        return usage_index2();
+      }
       break;
     case 'o':
       prefix = optarg;
@@ -505,7 +517,8 @@ int ms_index2(int argc, char *argv[]) {
   const std::string index_path = index_file_name(prefix.empty() ? fn : prefix);
   if (layout.mask < 0) layout.mask = fmsi2::default_layout().mask;
 
-  auto ms = read_masked_superstring(fn);
+  std::string header;
+  auto ms = read_masked_superstring(fn, &header);
   if (ms.size() == 0) {
     std::cerr << "ERROR: The file '" << fn << "' does not contain a masked superstring." << std::endl;
     return usage_index2();
@@ -517,14 +530,18 @@ int ms_index2(int argc, char *argv[]) {
   }
 
   size_t length = ms.size();
+  // The rows that start with the same k-mer tell the type of the mask, or check the one that is stated.
+  mbwt_with_same_kmer = true;
   mbwt m = compute_mbwt<uint64_t>(ms, k, false, use_qsufsort);
   std::cerr << "Constructed the masked Burrows-Wheeler transform" << std::endl;
   std::string().swap(ms);
   // The index is written from the MBWT; its layout in memory is built when it is loaded.
-  fmsi2::save_mbwt(m, k, layout, index_path);
+  const fmsi2::mask_statistics statistics = fmsi2::decide_mask_type(fmsi2::classify_mask(m), mask_type, header_field(header, "mask"));
+  if (!statistics.warning.empty()) std::cerr << "WARNING: " << statistics.warning << "." << std::endl;
+  const fmsi2::description description = fmsi2::save_mbwt(m, k, layout, statistics, index_path, 1, header);
   const double index_bytes = (double)std::filesystem::file_size(index_path);
   std::cerr << "Written " << index_path << ": " << (uint64_t)index_bytes << " bytes (" << 8 * index_bytes / length
-            << " bits per character of the superstring)" << std::endl;
+            << " bits per character of the superstring), mask " << statistics.type << " (" << statistics.source << ")" << std::endl;
   return 0;
 }
 
@@ -700,6 +717,10 @@ int ms_query2(int argc, char *argv[], bool output_orders) {
   }
   fmsi2::index index;
   fmsi2::load(index, index_path, threads, layout);
+  if (output_orders && index.mask_type_name != "min-one" && index.mask_type_name != "min-one,max-one") {
+    std::cerr << "Note: the mask of the index is " << (index.mask_type_name.empty() ? "of an unknown type" : index.mask_type_name)
+              << ", not min-one: the hashes are unique but may not be minimal (a k-mer set more than once has several)." << std::endl;
+  }
   if (k != 0 && k != (int)index.k) {
     std::cerr << "ERROR: Mismatch. Provided k (" << k << ") does not match the k of the index (" << index.k << ")." << std::endl;
     return usage_query2(output_orders);
@@ -1058,6 +1079,10 @@ int ms_info(int argc, char *argv[]) {
       const double characters = (double)(meta.number("rows") - 1);
       std::cout << "superstring_characters\t" << (uint64_t)characters << std::endl;
       std::cout << "bits_per_superstring_character\t" << 8.0 * in.file_bytes() / characters << std::endl;
+      if (meta.get("mask_type").find("min-one") == 0) {
+        std::cout << "kmers\t" << meta.number("mask_ones") << std::endl;
+        std::cout << "bits_per_kmer\t" << 8.0 * in.file_bytes() / meta.number("mask_ones") << std::endl;
+      }
     }
     for (const auto &e : in.sections()) {
       std::cout << "section\t" << e.name() << "\tencoding=" << e.encoding << "\tflags=" << ((e.flags & fmsi2::file::REQUIRED) ? "required" : "optional")
