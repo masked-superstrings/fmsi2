@@ -41,6 +41,8 @@ static int usage_index() {
   std::cerr << "    -k INT  - size of k-mers [recommended, default: number of mask trailing zeros - 1]"
             << std::endl;
   std::cerr << "    -x      - do not compute the kLCP array used for faster streaming queries."
+            << std::endl;
+  std::cerr << "    -Q      - construct the suffix array by QSufSort instead of libsais."
             << std::endl << std::endl;
   std::cerr << "Note: `fmsi index` accepts only masked superstrings - these can be computed e.g. by KmerCamel from any FASTA file." << std::endl << std::endl;
   return 1;
@@ -181,7 +183,8 @@ int ms_index(int argc, char *argv[]) {
 
   int k = 0;
   bool no_streaming = false;
-  while ((c = getopt(argc, argv, "hk:x")) >= 0) {
+  bool use_qsufsort = false;
+  while ((c = getopt(argc, argv, "hk:xQ")) >= 0) {
     switch (c) {
     case 'h':
       usage = true;
@@ -191,6 +194,9 @@ int ms_index(int argc, char *argv[]) {
       break;
     case 'x':
       no_streaming = true;
+      break;
+    case 'Q':
+      use_qsufsort = true;
       break;
     default:
       return usage_index();
@@ -227,8 +233,8 @@ int ms_index(int argc, char *argv[]) {
       no_streaming = true;
   }
   fms_index index;
-  if (k <= 32) index = construct<uint64_t>(ms, k, !no_streaming);
-  else index = construct<__uint128_t>(ms, k, !no_streaming);
+  if (k <= 32) index = construct<uint64_t>(ms, k, !no_streaming, use_qsufsort);
+  else index = construct<__uint128_t>(ms, k, !no_streaming, use_qsufsort);
   std::cerr << "Constructed index" << std::endl;
   dump_index(index, fn);
   std::cerr << "Written index" << std::endl;
