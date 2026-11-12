@@ -4,7 +4,7 @@ ARCH?=								native
 CXXFLAGS=							-g -Wall -Wno-unused-function -std=c++17 -O3 -march=$(ARCH) -pthread
 CC?=									cc
 CFLAGS=								-g -O2
-PROG=									../fmsi
+PROG=									../fmsi2
 INCLUDES-PATH?=.
 INCLUDES=							-I$(INCLUDES-PATH)/include -L$(INCLUDES-PATH)/lib 
 LIBS=									-lz -lsdsl -ldivsufsort -ldivsufsort64

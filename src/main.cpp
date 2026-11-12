@@ -15,10 +15,10 @@
 
 static int usage() {
   std::cerr << std::endl;
-  std::cerr << "Program: FMSI - a tool for space-efficient k-mer set indexing via masked superstrings." << std::endl;
+  std::cerr << "Program: FMSI 2 - a space-efficient index of k-mer sets based on masked superstrings." << std::endl;
   std::cerr << "Version: " << VERSION << std::endl;
   std::cerr << "Contact: Ondrej Sladky (ondra.sladky@gmail.com)" << std::endl << std::endl;
-  std::cerr << "Usage:   fmsi <command> [options]" << std::endl << std::endl;
+  std::cerr << "Usage:   fmsi2 <command> [options]" << std::endl << std::endl;
   std::cerr << "Command (stable):" << std::endl;
   std::cerr << "    index   - Creates a BWT based index of the given masked superstring." << std::endl;
   std::cerr << "    query   - Queries k-mers against an index." << std::endl;
@@ -36,7 +36,7 @@ static int usage() {
 
 static int usage_index() {
   std::cerr << std::endl;
-  std::cerr << "Usage:   fmsi index [options] <masked-superstring-input>" << std::endl << std::endl;
+  std::cerr << "Usage:   fmsi2 index [options] <masked-superstring-input>" << std::endl << std::endl;
   std::cerr << "Options:" << std::endl;
   std::cerr << "    -k INT  - size of k-mers [recommended, default: number of mask trailing zeros - 1]"
             << std::endl;
@@ -44,13 +44,13 @@ static int usage_index() {
             << std::endl;
   std::cerr << "    -Q      - construct the suffix array by QSufSort instead of libsais."
             << std::endl << std::endl;
-  std::cerr << "Note: `fmsi index` accepts only masked superstrings - these can be computed e.g. by KmerCamel from any FASTA file." << std::endl << std::endl;
+  std::cerr << "Note: `fmsi2 index` accepts only masked superstrings - these can be computed e.g. by KmerCamel from any FASTA file." << std::endl << std::endl;
   return 1;
 }
 
 static int usage_merge() {
   std::cerr << std::endl << 
-      "Usage:   fmsi merge [options]"
+      "Usage:   fmsi2 merge [options]"
       << std::endl << std::endl;
   std::cerr << std::endl << "Options:" << std::endl;
   std::cerr << "  `-p path_to_fasta`  - The path to the fasta file with "
@@ -68,7 +68,7 @@ static int usage_merge() {
 
 static int usage_op(std::string op) {
   std::cerr << std::endl << 
-      "Usage:   fmsi " << op << " [options]"
+      "Usage:   fmsi2 " << op << " [options]"
       << std::endl << std::endl;
   std::cerr << std::endl << "Options:" << std::endl;
   std::cerr << "  `-p path_to_fasta`  - The path to the fasta file with "
@@ -103,7 +103,7 @@ void usage_functions() {
 
 static int usage_query() {
   std::cerr << std::endl;
-  std::cerr << "Usage:   fmsi query [options] <index-prefix>" << std::endl << std::endl;
+  std::cerr << "Usage:   fmsi2 query [options] <index-prefix>" << std::endl << std::endl;
   std::cerr << "Options (stable):" << std::endl;
   std::cerr << "  -q FILE - Path to FASTA/FASTQ with queries [default: stdin]"
             << std::endl;
@@ -120,7 +120,7 @@ static int usage_query() {
 
 static int usage_lookup() {
   std::cerr << std::endl;
-  std::cerr << "Usage:   fmsi lookup [options] <index-prefix>" << std::endl << std::endl;
+  std::cerr << "Usage:   fmsi2 lookup [options] <index-prefix>" << std::endl << std::endl;
   std::cerr << "Options (stable):" << std::endl;
   std::cerr << "  -q FILE - Path to FASTA/FASTQ with queries [default: stdin]"
             << std::endl;
@@ -138,7 +138,7 @@ static int usage_query(bool lookup) {
 
 static int usage_normalize() {
   std::cerr << std::endl << 
-      "Usage:   fmsi compact [options] <index-prefix>"
+      "Usage:   fmsi2 compact [options] <index-prefix>"
       << std::endl << std::endl;
   std::cerr << std::endl << "Options (all experimental):" << std::endl;
   std::cerr << std::endl << "The recognized arguments are:" << std::endl;
@@ -154,14 +154,14 @@ static int usage_normalize() {
 
 static int usage_export() {
   std::cerr << std::endl << 
-      "Usage:   fmsi export <index-prefix>"
+      "Usage:   fmsi2 export <index-prefix>"
       << std::endl << std::endl;
     return 1;
 }
 
 static int usage_clean() {
   std::cerr << std::endl << 
-  "Usage:   fmsi clean <index-prefix>"
+  "Usage:   fmsi2 clean <index-prefix>"
   << std::endl << std::endl;
   return 1;
 }
@@ -308,7 +308,7 @@ int ms_query(int argc, char *argv[], bool output_orders) {
   fms_index index = load_index(fn, has_klcp);
 
   if (index.sa_transformed_mask.size() == 0) {
-    std::cerr << "ERROR: index not correctly loaded. Ensure that you correctly call `fmsi index` before." << std::endl;
+    std::cerr << "ERROR: index not correctly loaded. Ensure that you correctly call `fmsi2 index` before." << std::endl;
     return usage_query(output_orders);
   }
 
@@ -537,7 +537,7 @@ int ms_export(int argc, char *argv[]) {
     fms_index index = load_index(fn);
 
     if (index.sa_transformed_mask.size() == 0) {
-      std::cerr << "ERROR: index not correctly loaded. Ensure that you correctly call `fmsi index` before." << std::endl;
+      std::cerr << "ERROR: index not correctly loaded. Ensure that you correctly call `fmsi2 index` before." << std::endl;
       return usage_export();
     }
 

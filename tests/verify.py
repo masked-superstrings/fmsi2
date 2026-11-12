@@ -3,7 +3,7 @@ import random
 import subprocess
 import argparse
 
-fmsi_path = "../fmsi"
+fmsi_path = "../fmsi2"
 
 def reverse_complement(s):
     return "".join({"A": "T", "C": "G", "G": "C", "T": "A"}[c] for c in reversed(s))
