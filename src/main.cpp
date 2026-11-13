@@ -406,7 +406,9 @@ static int usage_index2() {
   std::cerr << "queries (fmsi2 query) and dictionary queries (fmsi2 lookup). The index is one file." << std::endl << std::endl;
   std::cerr << "Options:" << std::endl;
   std::cerr << "    -o FILE - the index file [default: <masked-superstring>.fmsi]; .fmsi is added if missing" << std::endl;
-  std::cerr << "    -k INT  - size of k-mers [default: number of trailing masked-out characters + 1]" << std::endl << std::endl;
+  std::cerr << "    -k INT  - size of k-mers [default: number of trailing masked-out characters + 1]" << std::endl;
+  std::cerr << "    -l      - also write the kLCP array (<index file>.klcp), which speeds up streamed queries (query -S)" << std::endl;
+  std::cerr << "              of sequences that do not follow the superstring, e.g. of RNA-seq reads" << std::endl << std::endl;
   std::cerr << "Advanced:" << std::endl;
   std::cerr << "    -c INT  - layout in memory recommended by the file, which fmsi2 query -c overrides: bytes per block" << std::endl;
   std::cerr << "              of the BWT, 64 (the fastest), 128 or 256 (the smallest) [default: 64]" << std::endl;
@@ -434,7 +436,8 @@ static int usage_query2(bool lookup) {
   std::cerr << "Options:" << std::endl;
   std::cerr << "  -q FILE - FASTA/FASTQ with the queries, may be gzipped [default: stdin]" << std::endl;
   std::cerr << "  -S      - streamed queries: search the k-mers of a sequence by extending the match of the previous one" << std::endl;
-  std::cerr << "            (for reads and longer sequences)" << std::endl;
+  std::cerr << "            (for reads and longer sequences); uses the kLCP array if the index has one" << std::endl;
+  std::cerr << "  -L      - do not use the kLCP array" << std::endl;
   std::cerr << "  -t INT  - number of threads [default: 1]" << std::endl << std::endl;
   std::cerr << "Advanced:" << std::endl;
   std::cerr << "  -c INT  - bytes per block of the BWT in memory: 64 (the fastest), 128 or 256 (the smallest)" << std::endl;
@@ -491,7 +494,8 @@ int ms_index2(int argc, char *argv[]) {
   // The layout in memory that the file recommends: the fastest one unless -c or -m is given.
   fmsi2::layout layout;
   std::string mask_type = "auto";
-  while ((c = getopt(argc, argv, "hk:m:c:o:QM:")) >= 0) {
+  bool use_klcp = false;
+  while ((c = getopt(argc, argv, "hk:m:c:lo:QM:")) >= 0) {
     switch (c) {
     case 'h':
       usage = true;
@@ -509,6 +513,9 @@ int ms_index2(int argc, char *argv[]) {
         std::cerr << "ERROR: The type of the mask is min-one, max-one or auto." << std::endl;
         return usage_index2();
       }
+      break;
+    case 'l':
+      use_klcp = true;
       break;
     case 'o':
       prefix = optarg;
@@ -547,7 +554,12 @@ int ms_index2(int argc, char *argv[]) {
   size_t length = ms.size();
   // The rows that start with the same k-mer tell the type of the mask, or check the one that is stated.
   mbwt_with_same_kmer = true;
-  mbwt m = compute_mbwt<uint64_t>(ms, k, false, use_qsufsort);
+  if (use_klcp && k > 65) {
+    std::cerr << "ERROR: The kLCP array (-l) is available for k <= 65." << std::endl;
+    return 1;
+  }
+  mbwt m = k <= 32 ? compute_mbwt<uint64_t>(ms, k, use_klcp, use_qsufsort)
+                   : compute_mbwt<__uint128_t>(ms, k, use_klcp, use_qsufsort);
   std::cerr << "Constructed the masked Burrows-Wheeler transform" << std::endl;
   std::string().swap(ms);
   // The index is written from the MBWT; its layout in memory is built when it is loaded.
@@ -557,6 +569,13 @@ int ms_index2(int argc, char *argv[]) {
   const double index_bytes = (double)std::filesystem::file_size(index_path);
   std::cerr << "Written " << index_path << ": " << (uint64_t)index_bytes << " bytes (" << 8 * index_bytes / length
             << " bits per character of the superstring), mask " << statistics.type << " (" << statistics.source << ")" << std::endl;
+  if (use_klcp) {
+    const std::string klcp_path = index_path + fmsi2::KLCP_EXTENSION;
+    fmsi2::save_klcp_bits(m.klcp, k, description.uid(), klcp_path);
+    const double klcp_bytes = (double)std::filesystem::file_size(klcp_path);
+    std::cerr << "Written " << klcp_path << ": " << (uint64_t)klcp_bytes << " bytes (" << 8 * klcp_bytes / length
+              << " bits per character of the superstring)" << std::endl;
+  }
   return 0;
 }
 
@@ -674,9 +693,10 @@ int ms_query2(int argc, char *argv[], bool output_orders) {
   int batch_size = 32;
   int prefix_length = 10;
   bool streaming = false;
+  bool use_klcp = true;
   int threads = 1;
   fmsi2::layout layout;
-  while ((c = getopt(argc, argv, "hq:k:b:p:St:c:m:O")) >= 0) {
+  while ((c = getopt(argc, argv, "hq:k:b:p:SLt:c:m:O")) >= 0) {
     switch (c) {
     case 'h':
       usage = true;
@@ -689,6 +709,9 @@ int ms_query2(int argc, char *argv[], bool output_orders) {
       break;
     case 'S':
       streaming = true;
+      break;
+    case 'L':
+      use_klcp = false;
       break;
     case 't':
       threads = atoi(optarg);
@@ -741,6 +764,9 @@ int ms_query2(int argc, char *argv[], bool output_orders) {
     std::cerr << "ERROR: Mismatch. Provided k (" << k << ") does not match the k of the index (" << index.k << ")." << std::endl;
     return usage_query2(output_orders);
   }
+  if (streaming && use_klcp && std::filesystem::exists(index_path + fmsi2::KLCP_EXTENSION)) {
+    fmsi2::load_klcp(index, index_path + fmsi2::KLCP_EXTENSION, threads);
+  }
   double load_seconds = seconds_since_start();
   fmsi2::build_prefix_table(index, prefix_length);
   double table_seconds = seconds_since_start() - load_seconds;
@@ -756,7 +782,7 @@ int ms_query2(int argc, char *argv[], bool output_orders) {
             << "\tkmers=" << stats.kmers << "\tfound=" << stats.found
             << "\tsteps_per_kmer=" << (stats.kmers ? (double)stats.steps / stats.kmers : 0)
             << "\tsearches=" << stats.searches << "\trechecks=" << stats.rechecks
-            << "\tthreads=" << threads
+            << "\tklcp=" << index.has_klcp() << "\tthreads=" << threads
             << "\tbwt_block_bytes=" << index.bwt.block_bytes() << "\tmask=" << fmsi2::mask_name(index.mask_type)
             << "\tindex_bytes_in_memory=" << index.bytes()
             << "\tloaded_rss_kb=" << loaded_bytes / 1000 << "\tload_peak_rss_kb=" << load_peak_bytes / 1000
@@ -1059,7 +1085,7 @@ int ms_clean(int argc, char *argv[]) {
   return 0;
 }
 
-/// Print what an index file holds: its metadata and its sections.
+/// Print what an index file holds: its metadata, its sections, and the kLCP file next to it.
 int ms_info(int argc, char *argv[]) {
   bool check = false;
   static const struct option long_options[] = {{"check", no_argument, nullptr, 'C'}, {nullptr, 0, nullptr, 0}};
@@ -1067,7 +1093,7 @@ int ms_info(int argc, char *argv[]) {
   auto usage = []() {
     std::cerr << std::endl << "Usage:   fmsi2 info [--check] <index.fmsi>" << std::endl << std::endl;
     std::cerr << "Prints what the index file holds and how: the description of the index, the sections of the file with" << std::endl;
-    std::cerr << "their encodings and sizes. --check verifies the checksums." << std::endl << std::endl;
+    std::cerr << "their encodings and sizes, and the kLCP file next to it. --check verifies the checksums." << std::endl << std::endl;
     return 1;
   };
   while ((c = getopt_long(argc, argv, "h", long_options, nullptr)) >= 0) {
@@ -1112,6 +1138,10 @@ int ms_info(int argc, char *argv[]) {
     }
   };
   print(path);
+  if (std::filesystem::exists(path + fmsi2::KLCP_EXTENSION) && fmsi2::file::file_version(path + fmsi2::KLCP_EXTENSION) != 0) {
+    std::cout << std::endl;
+    print(path + fmsi2::KLCP_EXTENSION);
+  }
   return 0;
 }
 

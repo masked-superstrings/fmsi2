@@ -42,12 +42,12 @@ diff $TESTS/result_normalized2.txt $BIN/merged_normalized2.fa || exit 1
 echo "merged_normalized2.fa OK"
 
 # FMSI 2: one index file, with the same answers as FMSI 1 in every layout.
-$PROG index -k 3 -o $BIN/a2 $TESTS/integration_a.fa 2> /dev/null || exit 1
-[ -f $BIN/a2.fmsi ] || exit 1
+$PROG index -l -k 3 -o $BIN/a2 $TESTS/integration_a.fa 2> /dev/null || exit 1
+[ -f $BIN/a2.fmsi ] && [ -f $BIN/a2.fmsi.klcp ] || exit 1
 $PROG info --check $BIN/a2.fmsi > $BIN/a2.info || exit 1
 grep -q "^k	3$" $BIN/a2.info || exit 1
 for layout in "" "-c 64 -m plain" "-c 128 -m packed" "-c 256 -m rrr"; do
-  for streaming in "" "-S"; do
+  for streaming in "" "-S" "-S -L"; do
     $PROG query $layout $streaming -q $TESTS/queries.txt $BIN/a2.fmsi > $BIN/a2.txt 2> /dev/null || exit 1
     diff $TESTS/result_a_complements.txt $BIN/a2.txt || exit 1
   done

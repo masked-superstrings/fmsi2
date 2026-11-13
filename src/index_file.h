@@ -1,6 +1,7 @@
 #pragma once
 
-// The container of the files of FMSI 2 (format 2.0): one file per index, <name>.fmsi.
+// The container of the files of FMSI 2 (format 2.0): one file per index, <name>.fmsi, and one per kLCP
+// array, <name>.fmsi.klcp.
 //
 // A file is a prologue, sections, and the table of the sections at its end:
 //

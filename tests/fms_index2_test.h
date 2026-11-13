@@ -227,7 +227,8 @@ TEST(FMS_INDEX2, MEMBERSHIP) {
         queries q = make_queries(rng, ms, k);
 
         for (auto mask_type : {fmsi2::mask_kind::plain, fmsi2::mask_kind::packed, fmsi2::mask_kind::rrr}) {
-            mbwt m = compute_mbwt<uint64_t>(ms, k, false);
+            // Streaming with and without the kLCP array.
+            mbwt m = compute_mbwt<uint64_t>(ms, k, (round / 2 + (int)mask_type) % 2);
             fmsi2::index index;
             fmsi2::build(index, m, k, mask_type, 64 << (round % 3));
             for (unsigned table : {0, 2, 10}) {
@@ -259,7 +260,7 @@ TEST(FMS_INDEX2, HASHES) {
         auto represented = represented_kmers(ms, k);
         queries q = make_queries(rng, ms, k);
 
-        mbwt m = compute_mbwt<uint64_t>(ms, k, false);
+        mbwt m = compute_mbwt<uint64_t>(ms, k, round / 9 % 2);
         fmsi2::index index;
         fmsi2::build(index, m, k, (fmsi2::mask_kind)(round % 3), 64 << (round / 3 % 3));
         fmsi2::build_prefix_table(index, round % 3 * 4);
@@ -324,7 +325,7 @@ std::vector<int64_t> hashes_of(fmsi2::index &index, const queries &q) {
     return result;
 }
 
-/// An index file gives the same index in every layout, whichever way it was written.
+/// An index file gives the same index in every layout, whichever way it was written, with its kLCP array.
 TEST(FMS_INDEX2, FILE_LAYOUTS) {
     std::mt19937_64 rng(7);
     const std::string path = testing::TempDir() + "fmsi2_layouts_test.fmsi";
@@ -333,10 +334,12 @@ TEST(FMS_INDEX2, FILE_LAYOUTS) {
         std::string ms = random_mask(rng, random_superstring(rng, k + 100 + rng() % 70000), k, round % 2);
         queries q = make_queries(rng, ms, k);
         mbwt_with_same_kmer = true;
-        mbwt m = compute_mbwt<uint64_t>(ms, k, false);
+        mbwt m = k <= 32 ? compute_mbwt<uint64_t>(ms, k, true) : compute_mbwt<__uint128_t>(ms, k, true);
         mbwt_with_same_kmer = false;
+        const sdsl::bit_vector klcp = m.klcp;
         const fmsi2::mask_statistics statistics = fmsi2::classify_mask(m);
-        fmsi2::save_mbwt(m, k, fmsi2::default_layout(), statistics, path, 1 + round % 3);
+        const fmsi2::description d = fmsi2::save_mbwt(m, k, fmsi2::default_layout(), statistics, path, 1 + round % 3);
+        fmsi2::save_klcp_bits(klcp, k, d.uid(), path + ".klcp", 1 + round % 3);
         fmsi2::index built;
         fmsi2::build(built, m, k, fmsi2::mask_kind::plain);
         const std::vector<int64_t> want = hashes_of(built, q);
@@ -357,6 +360,8 @@ TEST(FMS_INDEX2, FILE_LAYOUTS) {
                 if (mask < 0) ASSERT_EQ(loaded.mask_type, fmsi2::mask_kind::plain);
                 for (size_t i = 0; i < loaded.size; i += 1 + rng() % 7) ASSERT_EQ(loaded.mask_get(i), built.mask_get(i)) << "row " << i;
                 ASSERT_EQ(hashes_of(loaded, q), want) << "round " << round << " blocks " << block_bytes << " mask " << mask;
+                fmsi2::load_klcp(loaded, path + ".klcp", 2);
+                ASSERT_EQ(loaded.klcp, klcp);
 
                 // An index written from memory is the same file content-wise: it loads to the same index.
                 if (block_bytes == 128 && mask == (int)fmsi2::mask_kind::packed) {
@@ -366,12 +371,15 @@ TEST(FMS_INDEX2, FILE_LAYOUTS) {
                     ASSERT_EQ(again.bwt.block_bytes(), 128u);
                     ASSERT_EQ(again.mask_type, fmsi2::mask_kind::packed);
                     ASSERT_EQ(hashes_of(again, q), want);
+                    // Its kLCP file is recognized by the identifier of the content.
+                    fmsi2::load_klcp(again, path + ".klcp");
                     std::filesystem::remove(path + ".again");
                 }
             }
         }
     }
     std::filesystem::remove(path);
+    std::filesystem::remove(path + ".klcp");
 }
 
 /// Sections that a reader does not know are skipped unless they are required; damaged files are refused.
@@ -380,9 +388,10 @@ TEST(FMS_INDEX2, FILE_SECTIONS) {
     const size_t k = 11;
     std::string ms = random_mask(rng, random_superstring(rng, 5000000 / 100), k, true);
     queries q = make_queries(rng, ms, k);
-    mbwt m = compute_mbwt<uint64_t>(ms, k, false);
+    mbwt m = compute_mbwt<uint64_t>(ms, k, true);
+    const sdsl::bit_vector klcp = m.klcp;
     const std::string path = testing::TempDir() + "fmsi2_sections_test.fmsi";
-    fmsi2::save_mbwt(m, k, fmsi2::default_layout(), fmsi2::mask_statistics(), path);
+    const fmsi2::description d = fmsi2::save_mbwt(m, k, fmsi2::default_layout(), fmsi2::mask_statistics(), path);
     fmsi2::index reference;
     fmsi2::load(reference, path);
     const std::vector<int64_t> want = hashes_of(reference, q);
@@ -420,6 +429,24 @@ TEST(FMS_INDEX2, FILE_SECTIONS) {
         ASSERT_THROW(fmsi2::load(loaded, path + ".more"), std::invalid_argument);
     }
     std::filesystem::remove(path + ".more");
+
+    // A kLCP file of another index is refused.
+    {
+        std::string other = random_mask(rng, random_superstring(rng, ms.size()), k, true);
+        mbwt n = compute_mbwt<uint64_t>(other, k, true);
+        const fmsi2::description e = fmsi2::save_mbwt(n, k, fmsi2::default_layout(), fmsi2::mask_statistics(), path + ".other");
+        fmsi2::save_klcp_bits(n.klcp, k, e.uid(), path + ".other.klcp");
+        fmsi2::save_klcp_bits(klcp, k, d.uid(), path + ".klcp");
+        ASSERT_NE(d.uid(), e.uid());
+        fmsi2::index loaded;
+        fmsi2::load(loaded, path);
+        ASSERT_THROW(fmsi2::load_klcp(loaded, path + ".other.klcp"), std::invalid_argument);
+        fmsi2::load_klcp(loaded, path + ".klcp");
+        ASSERT_EQ(loaded.klcp, klcp);
+        std::filesystem::remove(path + ".other");
+        std::filesystem::remove(path + ".other.klcp");
+        std::filesystem::remove(path + ".klcp");
+    }
 
     // Truncated and damaged files.
     std::ifstream in(path, std::ios::binary);

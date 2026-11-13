@@ -62,3 +62,4 @@ src/sdsl-lite/test/compile_test.cpp
 
 # Index files of FMSI 2
 *.fmsi
+*.fmsi.klcp

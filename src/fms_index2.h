@@ -48,6 +48,10 @@ struct index {
     sdsl::rrr_vector<RRR_BLOCK_SIZE> mask_rrr;
     sdsl::rank_support_rrr<1, RRR_BLOCK_SIZE> mask_rrr_rank;
 
+    /// Optional kLCP array for streaming, stored in a file of its own: bit i is set iff the suffixes
+    /// of the rows i and i + 1 share their first k - 1 characters.
+    sdsl::bit_vector klcp;
+
     /// SA intervals of all patterns of length prefix_length; computed at load time, not stored.
     uint32_t prefix_length = 0;
     std::vector<uint64_t> prefix_table;
@@ -55,6 +59,8 @@ struct index {
     /// The number of set bits of the mask, i.e., of hashes; computed when the index is built or loaded.
     uint64_t mask_ones = 0;
 
+    /// The identifier of the content of the index (0 if unknown), by which its kLCP file is recognized.
+    uint64_t uid = 0;
     /// The type of the mask as the index file states it: "min-one" (every k-mer of the set has one set
     /// occurrence, so that lookup is a minimal perfect hash), "max-one" (all occurrences of the k-mers of the
     /// set are set), "min-one,max-one", "other", or "" if unknown; and how it is known ("computed", "declared").
@@ -62,8 +68,8 @@ struct index {
     /// The FASTA header of the masked superstring that was indexed, if the index file has it.
     std::string superstring_header;
 
-    /// Bytes of the index in memory: the BWT, the mask and the table of patterns.
-    size_t bytes() const { return bwt.bytes() + mask_bytes() + prefix_table.size() * 8; }
+    /// Bytes of the index in memory: the BWT, the mask, the kLCP array and the table of patterns.
+    size_t bytes() const { return bwt.bytes() + mask_bytes() + (klcp.size() + 7) / 8 + prefix_table.size() * 8; }
 
     index() = default;
     index(const index &) = delete;
@@ -115,6 +121,28 @@ struct index {
             if (mask_get(q)) return true;
         }
         return stop < j && mask_rank(stop) != mask_rank(j);
+    }
+
+    inline bool has_klcp() const { return klcp.size() > 0; }
+
+    inline void klcp_prefetch(size_t i, size_t j) const {
+        __builtin_prefetch(klcp.data() + ((i - 1) >> 6));
+        __builtin_prefetch(klcp.data() + ((j - 1) >> 6));
+    }
+
+    /// Go from the interval of a string of at least k - 1 characters to the one of its first k - 1 characters.
+    inline void klcp_widen(size_t &i, size_t &j) const {
+        const uint64_t *words = klcp.data();
+        // The first unset bit from j - 1 on; the last bit of the array is unset.
+        size_t w = (j - 1) >> 6;
+        uint64_t unset = ~words[w] & (~0ULL << ((j - 1) & 63));
+        while (unset == 0) unset = ~words[++w];
+        j = (w << 6) + __builtin_ctzll(unset) + 1;
+        // The last unset bit up to i - 1; bit 0 is unset.
+        w = (i - 1) >> 6;
+        unset = ~words[w] & (~0ULL >> (63 - ((i - 1) & 63)));
+        while (unset == 0) unset = ~words[--w];
+        i = (w << 6) + 64 - __builtin_clzll(unset);
     }
 
     /// Whether mask_prefetch() reads memory that should be prefetched itself, by mask_prefetch_directory().
@@ -225,6 +253,7 @@ void build(index &ix, mbwt &m, int k, mask_kind mask_type, uint32_t bwt_block_by
     const mask_statistics statistics = classify_mask(m);
     ix.mask_type_name = statistics.type == "unknown" ? "" : statistics.type;
     ix.mask_type_source = statistics.source;
+    ix.klcp = std::move(m.klcp);
 
     ix.bwt = quad_sequence(m.bwt.size(), bwt_block_bytes);
     uint64_t totals[4] = {0, 0, 0, 0};
@@ -298,15 +327,21 @@ inline bool parse_mask_name(const std::string &name, mask_kind &kind) {
 ///         byte i / 4), the sentinel stored as A; not compressed, as it does not compress
 ///   MASK  encoding 1: the mask in the order of the suffix array, one bit per row (bit i at bit i % 8 of byte
 ///         i / 8); compressed
+/// The kLCP array is a file of its own (<index file>.klcp) with META and
+///   KLCP  encoding 1: one bit per row (bit i is set iff rows i and i + 1 share their first k - 1 characters);
+///         compressed
 /// The rank counts of the BWT and of the mask and the table of the first search steps are not stored: they are
 /// computed when the file is loaded, in the layout asked for.
 ///
 /// Keys of META of an index: kind (index), creator, k, rows (the length of the BWT), dollar (the row of the
 /// sentinel), counts (the four cumulative character counts), mask_ones, mask_order (sa), layout (the recommended
-/// layout in memory: bytes per block of the BWT and the mask encoding). Unknown keys are ignored.
+/// layout in memory: bytes per block of the BWT and the mask encoding), uid (an identifier of the content, which
+/// the kLCP file repeats as index_uid). Unknown keys are ignored.
 static const uint32_t ENCODING_BWT_PACKED = 1;
 static const uint32_t ENCODING_MASK_SA_BITS = 1;
+static const uint32_t ENCODING_KLCP_BITS = 1;
 static const char *const INDEX_EXTENSION = ".fmsi";
+static const char *const KLCP_EXTENSION = ".klcp";
 
 /// The mask as a bitvector, whatever its encoding.
 inline sdsl::bit_vector mask_bits(const index &ix) {
@@ -327,7 +362,30 @@ struct description {
     layout recommended;
     /// The type of the mask and how it is known (mask_statistics), and the FASTA header of the masked superstring.
     std::string mask_type, mask_type_source, superstring_header;
+
+    /// An identifier of the content: a hash of the numbers above, which two different indexes hardly share.
+    uint64_t uid() const {
+        uint64_t hash = 1469598103934665603ULL;
+        auto mix = [&](uint64_t value) {
+            for (int byte = 0; byte < 8; ++byte) {
+                hash ^= (value >> (8 * byte)) & 255;
+                hash *= 1099511628211ULL;
+            }
+        };
+        mix(k);
+        mix(rows);
+        mix(dollar_position);
+        for (int c = 0; c < 4; ++c) mix(counts[c]);
+        mix(mask_ones);
+        return hash;
+    }
 };
+
+inline std::string hex(uint64_t value) {
+    char buffer[17];
+    snprintf(buffer, sizeof(buffer), "%016llx", (unsigned long long)value);
+    return buffer;
+}
 
 inline std::string creator() { return std::string("fmsi2 ") + VERSION; }
 
@@ -350,6 +408,7 @@ inline void write_index_file(const std::string &path, const description &d,
     if (!d.superstring_header.empty()) meta.set("superstring_header", d.superstring_header);
     meta.set("mask_order", "sa");
     meta.set("layout", std::to_string(d.recommended.bwt_block_bytes) + "," + mask_name((mask_kind)d.recommended.mask));
+    meta.set("uid", hex(d.uid()));
     const std::string text = meta.text();
 
     file::writer out(path);
@@ -490,6 +549,7 @@ inline void load(index &ix, const std::string &path, unsigned threads = 1, layou
     ix.size = d.rows;
     ix.dollar_position = d.dollar_position;
     for (int c = 0; c < 4; ++c) ix.counts[c] = d.counts[c];
+    ix.uid = d.uid();
     ix.mask_type_name = d.mask_type == "unknown" ? "" : d.mask_type;
     ix.mask_type_source = d.mask_type_source;
     ix.superstring_header = d.superstring_header;
@@ -531,6 +591,45 @@ inline void load(index &ix, const std::string &path, unsigned threads = 1, layou
     }
     ix.mask_ones = ix.mask_rank(ix.size);
     if (ix.mask_ones != d.mask_ones) throw std::invalid_argument("file " + path + " is damaged: the mask does not match its description");
+}
+
+/// The kLCP array is kept in a file of its own, as it is needed for streaming only: META (kind klcp, k, rows,
+/// klcp_ones, index_uid) and the bits, compressed.
+inline void save_klcp_bits(const sdsl::bit_vector &klcp, uint32_t k, uint64_t uid, const std::string &path, unsigned threads = 1) {
+    uint64_t ones = 0;
+    for (size_t w = 0; w < (klcp.size() + 63) / 64; ++w) ones += __builtin_popcountll(klcp.data()[w]);
+    file::metadata meta;
+    meta.set("kind", "klcp");
+    meta.set("creator", creator());
+    meta.set("k", k);
+    meta.set("rows", klcp.size());
+    meta.set("klcp_ones", ones);
+    meta.set("index_uid", hex(uid));
+    const std::string text = meta.text();
+    file::writer out(path);
+    out.add("META", 1, file::REQUIRED, meta.items().size(), text.data(), text.size());
+    out.add_stream("KLCP", ENCODING_KLCP_BITS, file::REQUIRED, klcp.size(), (klcp.size() + 7) / 8, true, threads,
+                   [&](uint64_t begin, uint64_t end, uint8_t *buffer) { bit_vector_bytes(klcp, begin, end, buffer); });
+    out.finish();
+}
+
+inline void save_klcp(const index &ix, const std::string &path, unsigned threads = 1) {
+    save_klcp_bits(ix.klcp, ix.k, describe(ix).uid(), path, threads);
+}
+
+inline void load_klcp(index &ix, const std::string &path, unsigned threads = 1) {
+    file::reader in(path);
+    in.check_known({"META", "KLCP"});
+    const file::metadata meta = in.meta();
+    const file::section_entry &bits = in.get("KLCP");
+    if (meta.get("kind") != "klcp" || meta.number("rows") != ix.size || bits.encoding != ENCODING_KLCP_BITS ||
+        bits.items != ix.size || bits.raw_bytes != (ix.size + 7) / 8 || (ix.uid != 0 && meta.get("index_uid") != hex(ix.uid))) {
+        throw std::invalid_argument("file " + path + " is not the kLCP array of the index");
+    }
+    ix.klcp = sdsl::bit_vector(ix.size, 0);
+    in.read(bits, threads, [&](uint64_t offset, const uint8_t *data, size_t bytes) {
+        for_each_word(offset, data, bytes, ix.size, [&](uint64_t first, uint64_t word, unsigned count) { ix.klcp.set_int(first, word, count); });
+    });
 }
 
 /// The file of an index given as the file itself, or as the name without its extension (a prefix, as the
@@ -731,6 +830,10 @@ struct segment {
 /// subset of the occurrences of the k-mer, hence a set mask bit proves the k-mer represented, while an
 /// unset one requires searching the k-mer itself. This needs no kLCP array.
 ///
+/// If the index has the kLCP array, the last character of the match is dropped before the match is
+/// extended, so the match stays a k-mer: consecutive k-mers of the query need not be consecutive in the
+/// superstring and no k-mer is searched again because of an unset mask bit.
+///
 /// When a window cannot be found, the search stopped on a substring that does not occur in the
 /// superstring, so that all windows containing it are absent on this strand. To find such substrings
 /// cheaply, the unresolved windows containing the position where the search stopped are searched
@@ -745,6 +848,7 @@ void lookup_streaming(const index &ix, const char *sequence, const segment *segm
     const out_t UNRESOLVED = hashes ? -1 : 0;
     const out_t ABSENT[2] = {(out_t)(hashes ? -2 : 2), (out_t)(hashes ? -3 : 3)};
     const int NO_BLOCK = -1;
+    const bool klcp = ix.has_klcp();
 
     enum : uint8_t { IDLE, START, SEARCH, CHECK };
     struct slot {
@@ -890,6 +994,7 @@ void lookup_streaming(const index &ix, const char *sequence, const segment *segm
         s.hint = ix.mask_prefetch(s.i);
         ix.bwt.prefetch(s.i);
         ix.bwt.prefetch(s.j);
+        if (klcp) ix.klcp_prefetch(s.i, s.j);
     };
     auto after_search_step = [&](slot &s) {
         if (s.i == s.j) {
@@ -932,13 +1037,19 @@ void lookup_streaming(const index &ix, const char *sequence, const segment *segm
             return;
         }
         --s.x;
+        // With the kLCP array, drop the last character of the k-mer first, so that the match stays a k-mer.
+        if (klcp) ix.klcp_widen(s.i, s.j);
         update_range(ix, s.i, s.j, symbol(s, s.x));
         ++steps;
-        if (s.i == s.j) {
-            begin_search(s, s.x);
-        } else {
-            s.exact = 0;
+        if (s.i != s.j) {
+            s.exact = klcp;
             to_check(s);
+        } else if (klcp) {
+            // The window does not occur although its last k - 1 characters do: searching it would tell nothing more.
+            s.t = k;
+            search_failed(s);
+        } else {
+            begin_search(s, s.x);
         }
     };
 
