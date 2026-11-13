@@ -409,7 +409,10 @@ static int usage_index2() {
   std::cerr << "    -o FILE - the index file [default: <masked-superstring>.fmsi]; .fmsi is added if missing" << std::endl;
   std::cerr << "    -k INT  - size of k-mers [default: number of trailing masked-out characters + 1]" << std::endl;
   std::cerr << "    -l      - also write the kLCP array (<index file>.klcp), which speeds up streamed queries (query -S)" << std::endl;
-  std::cerr << "              of sequences that do not follow the superstring, e.g. of RNA-seq reads" << std::endl << std::endl;
+  std::cerr << "              of sequences that do not follow the superstring, e.g. of RNA-seq reads" << std::endl;
+  std::cerr << "    -t INT  - number of threads [default: 1]; the suffix array is constructed on "
+            << (SUFFIX_ARRAY_THREADED ? "all of them (compiled with OpenMP)" : "one thread (compiled without OpenMP)")
+            << std::endl << std::endl;
   std::cerr << "Advanced:" << std::endl;
   std::cerr << "    -c INT  - layout in memory recommended by the file, which fmsi2 query -c overrides: bytes per block" << std::endl;
   std::cerr << "              of the BWT, 64 (the fastest), 128 or 256 (the smallest) [default: 64]" << std::endl;
@@ -498,7 +501,8 @@ int ms_index2(int argc, char *argv[]) {
   fmsi2::layout layout;
   std::string mask_type = "auto";
   bool use_klcp = false;
-  while ((c = getopt(argc, argv, "hk:m:c:lo:QM:")) >= 0) {
+  int threads = 1;
+  while ((c = getopt(argc, argv, "hk:m:c:lo:Qt:M:")) >= 0) {
     switch (c) {
     case 'h':
       usage = true;
@@ -526,6 +530,13 @@ int ms_index2(int argc, char *argv[]) {
     case 'Q':
       use_qsufsort = true;
       break;
+    case 't':
+      threads = atoi(optarg);
+      if (threads < 1) {
+        std::cerr << "ERROR: The number of threads must be positive." << std::endl;
+        return usage_index2();
+      }
+      break;
     default:
       return usage_index2();
     }
@@ -542,12 +553,14 @@ int ms_index2(int argc, char *argv[]) {
   if (layout.bwt_block_bytes == 0) layout.bwt_block_bytes = default_layout.bwt_block_bytes;
   if (layout.mask < 0) layout.mask = default_layout.mask;
 
+  build_phases = phase_timer();
   std::string header;
   auto ms = read_masked_superstring(fn, &header);
   if (ms.size() == 0) {
     std::cerr << "ERROR: The file '" << fn << "' does not contain a masked superstring." << std::endl;
     return usage_index2();
   }
+  build_phases.lap("read");
   std::cerr << "Read masked superstring of length " << ms.size() << std::endl;
   if (k == 0) {
     k = infer_k(ms);
@@ -561,24 +574,33 @@ int ms_index2(int argc, char *argv[]) {
     std::cerr << "ERROR: The kLCP array (-l) is available for k <= 65." << std::endl;
     return 1;
   }
-  mbwt m = k <= 32 ? compute_mbwt<uint64_t>(ms, k, use_klcp, use_qsufsort)
-                   : compute_mbwt<__uint128_t>(ms, k, use_klcp, use_qsufsort);
+  mbwt m = k <= 32 ? compute_mbwt<uint64_t>(ms, k, use_klcp, use_qsufsort, threads)
+                   : compute_mbwt<__uint128_t>(ms, k, use_klcp, use_qsufsort, threads);
   std::cerr << "Constructed the masked Burrows-Wheeler transform" << std::endl;
   std::string().swap(ms);
   // The index is written from the MBWT; its layout in memory is built when it is loaded.
   const fmsi2::mask_statistics statistics = fmsi2::decide_mask_type(fmsi2::classify_mask(m), mask_type, header_field(header, "mask"));
   if (!statistics.warning.empty()) std::cerr << "WARNING: " << statistics.warning << "." << std::endl;
-  const fmsi2::description description = fmsi2::save_mbwt(m, k, layout, statistics, index_path, 1, header);
+  const fmsi2::description description = fmsi2::save_mbwt(m, k, layout, statistics, index_path, threads, header);
   const double index_bytes = (double)std::filesystem::file_size(index_path);
   std::cerr << "Written " << index_path << ": " << (uint64_t)index_bytes << " bytes (" << 8 * index_bytes / length
             << " bits per character of the superstring), mask " << statistics.type << " (" << statistics.source << ")" << std::endl;
   if (use_klcp) {
     const std::string klcp_path = index_path + fmsi2::KLCP_EXTENSION;
-    fmsi2::save_klcp_bits(m.klcp, k, description.uid(), klcp_path);
+    fmsi2::save_klcp_bits(m.klcp, k, description.uid(), klcp_path, threads);
     const double klcp_bytes = (double)std::filesystem::file_size(klcp_path);
     std::cerr << "Written " << klcp_path << ": " << (uint64_t)klcp_bytes << " bytes (" << 8 * klcp_bytes / length
               << " bits per character of the superstring)" << std::endl;
   }
+  build_phases.lap("write");
+
+  double total = 0;
+  std::cerr << "[fmsi2-build]\tthreads=" << threads << "\topenmp=" << SUFFIX_ARRAY_THREADED;
+  for (const auto &phase : build_phases.phases) {
+    std::cerr << "\t" << phase.first << "_s=" << phase.second;
+    total += phase.second;
+  }
+  std::cerr << "\ttotal_s=" << total << std::endl;
   return 0;
 }
 

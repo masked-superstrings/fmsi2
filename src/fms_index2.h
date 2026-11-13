@@ -12,6 +12,7 @@
 //  - the SA intervals of all short patterns are tabulated when the index is loaded,
 //  - k-mers are searched in lockstep, each step prefetching the cache lines of the next one.
 
+#include <array>
 #include <algorithm>
 #include <chrono>
 #include <fstream>
@@ -246,7 +247,7 @@ inline mask_statistics decide_mask_type(mask_statistics computed, const std::str
 }
 
 /// Build the index from the MBWT, which is consumed.
-void build(index &ix, mbwt &m, int k, mask_kind mask_type, uint32_t bwt_block_bytes = 64) {
+void build(index &ix, mbwt &m, int k, mask_kind mask_type, uint32_t bwt_block_bytes = 64, unsigned threads = 1) {
     ix.k = k;
     ix.size = m.bwt.size();
     ix.dollar_position = m.dollar_position;
@@ -256,13 +257,23 @@ void build(index &ix, mbwt &m, int k, mask_kind mask_type, uint32_t bwt_block_by
     ix.klcp = std::move(m.klcp);
 
     ix.bwt = quad_sequence(m.bwt.size(), bwt_block_bytes);
+    std::vector<std::array<uint64_t, 4>> counted(threads, std::array<uint64_t, 4>{0, 0, 0, 0});
+    // Four symbols make a byte, so the threads write to different bytes.
+    parallel_chunks(m.bwt.size(), threads, parallel_chunk(4), [&](size_t begin, size_t end, unsigned thread) {
+        uint64_t local[4] = {0, 0, 0, 0};
+        for (size_t i = begin; i < end; ++i) {
+            ix.bwt.set(i, m.bwt[i]);
+            local[m.bwt[i]]++;
+        }
+        for (int c = 0; c < 4; ++c) counted[thread][c] += local[c];
+    });
     uint64_t totals[4] = {0, 0, 0, 0};
-    for (size_t i = 0; i < m.bwt.size(); ++i) {
-        ix.bwt.set(i, m.bwt[i]);
-        totals[m.bwt[i]]++;
+    for (const auto &part : counted) {
+        for (int c = 0; c < 4; ++c) totals[c] += part[c];
     }
-    ix.bwt.finalize();
+    ix.bwt.finalize(threads);
     m.bwt = std::vector<byte>();
+    build_phases.lap("pack_bwt");
     // The count of A includes the dollar, which stands for the smallest suffix.
     ix.counts[0] = 1;
     ix.counts[1] = totals[0];
@@ -272,10 +283,14 @@ void build(index &ix, mbwt &m, int k, mask_kind mask_type, uint32_t bwt_block_by
     ix.mask_type = mask_type;
     if (mask_type == mask_kind::plain) {
         ix.mask = bit_rank(m.sa_transformed_mask.size());
-        for (size_t i = 0; i < m.sa_transformed_mask.size(); ++i) {
-            if (m.sa_transformed_mask[i]) ix.mask.set(i);
-        }
-        ix.mask.finalize();
+        // A chunk is a whole number of blocks of the mask.
+        parallel_chunks(m.sa_transformed_mask.size(), threads, parallel_chunk(bit_rank::BLOCK_BITS),
+                        [&](size_t begin, size_t end, unsigned) {
+                            for (size_t i = begin; i < end; ++i) {
+                                if (m.sa_transformed_mask[i]) ix.mask.set(i);
+                            }
+                        });
+        ix.mask.finalize(threads);
     } else if (mask_type == mask_kind::packed) {
         ix.mask_packed.build(m.sa_transformed_mask.size(), [&](size_t i) { return (bool)m.sa_transformed_mask[i]; });
     } else {
@@ -284,6 +299,7 @@ void build(index &ix, mbwt &m, int k, mask_kind mask_type, uint32_t bwt_block_by
     }
     m.sa_transformed_mask.resize(0);
     ix.mask_ones = ix.mask_rank(ix.size);
+    build_phases.lap("pack_mask");
 }
 
 /// The layout of an index in memory. It is chosen when the index is loaded, as the file holds the BWT and the
@@ -440,8 +456,16 @@ inline description save_mbwt(const mbwt &m, int k, layout recommended, const mas
     // One line of the metadata.
     d.superstring_header = superstring_header;
     std::replace(d.superstring_header.begin(), d.superstring_header.end(), '\n', ' ');
+    std::vector<std::array<uint64_t, 4>> counted(threads, std::array<uint64_t, 4>{0, 0, 0, 0});
+    parallel_chunks(m.bwt.size(), threads, parallel_chunk(4), [&](size_t begin, size_t end, unsigned thread) {
+        uint64_t local[4] = {0, 0, 0, 0};
+        for (size_t i = begin; i < end; ++i) local[m.bwt[i]]++;
+        for (int c = 0; c < 4; ++c) counted[thread][c] += local[c];
+    });
     uint64_t totals[4] = {0, 0, 0, 0};
-    for (size_t i = 0; i < m.bwt.size(); ++i) totals[m.bwt[i]]++;
+    for (const auto &part : counted) {
+        for (int c = 0; c < 4; ++c) totals[c] += part[c];
+    }
     // The count of A includes the sentinel, which stands for the smallest suffix.
     d.counts[0] = 1;
     d.counts[1] = totals[0];
@@ -540,7 +564,7 @@ inline description read_description(const file::reader &in) {
 
 /// Load an index in the given layout (by default the one the file recommends). The BWT is read into its blocks
 /// and the mask decoded into its encoding piece by piece, so that the peak memory is that of the loaded index;
-/// the sections are read on the given threads.
+/// the rank counts are computed on the given threads.
 inline void load(index &ix, const std::string &path, unsigned threads = 1, layout wanted = layout()) {
     file::reader in(path);
     in.check_known({"META", "BWT", "MASK"});
@@ -563,7 +587,7 @@ inline void load(index &ix, const std::string &path, unsigned threads = 1, layou
     }
     ix.bwt = quad_sequence(d.rows, block_bytes);
     in.read(bwt, threads, [&](uint64_t offset, const uint8_t *data, size_t bytes) { ix.bwt.set_packed(offset, data, bytes); });
-    ix.bwt.finalize();
+    ix.bwt.finalize(threads);
 
     const file::section_entry &mask = in.get("MASK");
     if (mask.encoding != ENCODING_MASK_SA_BITS || mask.items != d.rows || mask.raw_bytes != (d.rows + 7) / 8) {
@@ -574,7 +598,7 @@ inline void load(index &ix, const std::string &path, unsigned threads = 1, layou
         in.read(mask, threads, [&](uint64_t offset, const uint8_t *data, size_t bytes) {
             for_each_word(offset, data, bytes, d.rows, [&](uint64_t first, uint64_t word, unsigned count) { ix.mask.set_bits(first, word, count); });
         });
-        ix.mask.finalize();
+        ix.mask.finalize(threads);
     } else if (ix.mask_type == mask_kind::packed) {
         ix.mask_packed.build_stream(d.rows, d.mask_ones, [&](auto sink) {
             in.read(mask, threads, [&](uint64_t offset, const uint8_t *data, size_t bytes) {
