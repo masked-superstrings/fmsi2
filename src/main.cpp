@@ -28,6 +28,7 @@ static int usage() {
   std::cerr << "    index   - Index a masked superstring: one file <name>.fmsi." << std::endl;
   std::cerr << "    query   - Membership queries: for every k-mer of the queries, whether it is in the set." << std::endl;
   std::cerr << "    lookup  - Dictionary queries: the hash of every k-mer of the queries (-1 if it is not in the set)." << std::endl;
+  std::cerr << "    access  - Dictionary queries: the k-mer of every hash, the inverse of lookup." << std::endl;
   std::cerr << "    info    - Print what an index file holds." << std::endl << std::endl;
   std::cerr << "Commands of FMSI 1 (its index of several files; `fmsi2 legacy` lists them):" << std::endl;
   std::cerr << "    legacy <command> - index, query, lookup, export, and the experimental set operations" << std::endl;
@@ -404,7 +405,7 @@ static int usage_index2() {
   std::cerr << std::endl;
   std::cerr << "Usage:   fmsi2 index [options] <masked-superstring>" << std::endl << std::endl;
   std::cerr << "Indexes a masked superstring (FASTA, lower case = masked out; e.g. from KmerCamel) for membership" << std::endl;
-  std::cerr << "queries (fmsi2 query) and dictionary queries (fmsi2 lookup). The index is one file." << std::endl << std::endl;
+  std::cerr << "queries (fmsi2 query) and dictionary queries (fmsi2 lookup, fmsi2 access). The index is one file." << std::endl << std::endl;
   std::cerr << "Options:" << std::endl;
   std::cerr << "    -o FILE - the index file [default: <masked-superstring>.fmsi]; .fmsi is added if missing" << std::endl;
   std::cerr << "    -k INT  - size of k-mers [default: number of trailing masked-out characters + 1]" << std::endl;
@@ -432,7 +433,7 @@ static int usage_query2(bool lookup) {
   if (lookup) {
     std::cerr << "Dictionary queries: prints, for every sequence of the queries, the hashes of its k-mers (-1 for a k-mer" << std::endl;
     std::cerr << "that is not in the set). With a min-one mask the hashes are a minimal perfect hash, 0 to (number of" << std::endl;
-    std::cerr << "k-mers - 1)." << std::endl << std::endl;
+    std::cerr << "k-mers - 1); fmsi2 access inverts them." << std::endl << std::endl;
   } else {
     std::cerr << "Membership queries: prints, for every sequence of the queries, a string of 1 (in the set) and 0 for its" << std::endl;
     std::cerr << "k-mers. Works with any mask." << std::endl << std::endl;
@@ -1035,6 +1036,121 @@ int ms_clean(int argc, char *argv[]) {
   return 0;
 }
 
+static int usage_access2() {
+  std::cerr << std::endl;
+  std::cerr << "Usage:   fmsi2 access [options] <index.fmsi>" << std::endl << std::endl;
+  std::cerr << "Dictionary queries: prints the k-mer of every hash, as it occurs in the masked superstring; the inverse of" << std::endl;
+  std::cerr << "`fmsi2 lookup` (for a min-one mask, of its minimal perfect hash). A value that is not a hash gives a line with `-`." << std::endl << std::endl;
+  std::cerr << "Options:" << std::endl;
+  std::cerr << "  -q FILE - Hashes, one non-negative integer per line; if `-` or not provided then standard input is used." << std::endl;
+  std::cerr << "  -b INT  - Number of k-mers retrieved at the same time, with prefetching [default: 32]" << std::endl;
+  std::cerr << std::endl;
+  return 1;
+}
+
+int ms_access2(int argc, char *argv[]) {
+  bool usage = false;
+  int c;
+  std::string fn;
+  if (argc > 1 && std::string(argv[argc - 1]) != "-h") {
+    fn = argv[argc - 1];
+    argc--;
+  }
+  std::string query_fn = "-";
+  int batch_size = 32;
+  while ((c = getopt(argc, argv, "hq:b:")) >= 0) {
+    switch (c) {
+    case 'h':
+      usage = true;
+      break;
+    case 'q':
+      query_fn = optarg;
+      break;
+    case 'b':
+      batch_size = atoi(optarg);
+      break;
+    default:
+      return usage_access2();
+    }
+  }
+  if (usage) {
+    usage_access2();
+    return 0;
+  } else if (fn.empty()) {
+    std::cerr << "ERROR: The index file is a required argument." << std::endl;
+    return usage_access2();
+  } else if (batch_size < 1) {
+    std::cerr << "ERROR: The batch size must be positive." << std::endl;
+    return usage_access2();
+  }
+
+  const std::string index_path = fmsi2::find_index_file(fn);
+  if (index_path.empty()) {
+    std::cerr << "ERROR: No index file " << fn << " (nor " << fn << fmsi2::INDEX_EXTENSION << ")." << std::endl;
+    return 1;
+  }
+  fmsi2::index index;
+  // Access selects on the mask, which only the plain encoding supports directly.
+  fmsi2::layout layout;
+  layout.mask = (int)fmsi2::mask_kind::plain;
+  fmsi2::load(index, index_path, 1, layout);
+  fmsi2::build_access_support(index);
+
+  std::ifstream file;
+  if (query_fn != "-") {
+    file.open(query_fn);
+    if (!file) {
+      std::cerr << "ERROR: Cannot open " << query_fn << std::endl;
+      return 1;
+    }
+  }
+  std::istream &in = query_fn == "-" ? std::cin : file;
+
+  // The hashes are processed in chunks; a value that is not a hash is replaced by a valid one and its line by `-`.
+  const size_t chunk = 1 << 16, k = index.k;
+  std::vector<uint64_t> hashes;
+  std::vector<bool> valid;
+  std::string kmers, output, line;
+  uint64_t total = 0, invalid = 0;
+  double seconds = 0;
+  bool more = true;
+  while (more) {
+    hashes.clear();
+    valid.clear();
+    while (hashes.size() < chunk && (more = (bool)std::getline(in, line))) {
+      char *end = nullptr;
+      errno = 0;
+      unsigned long long value = strtoull(line.c_str(), &end, 10);
+      bool is_hash = !line.empty() && isdigit((unsigned char)line[0]) && errno == 0 && value < index.mask_ones &&
+                     (*end == '\0' || isspace((unsigned char)*end));
+      hashes.push_back(is_hash ? value : 0);
+      valid.push_back(is_hash);
+      invalid += !is_hash;
+    }
+    if (index.mask_ones == 0) std::fill(valid.begin(), valid.end(), false);
+    kmers.assign(hashes.size() * k, 0);
+    auto start = std::chrono::steady_clock::now();
+    if (index.mask_ones > 0) fmsi2::access_batch(index, hashes.data(), hashes.size(), kmers.data(), batch_size);
+    seconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    output.clear();
+    for (size_t i = 0; i < hashes.size(); ++i) {
+      if (valid[i]) {
+        output.append(kmers, i * k, k);
+      } else {
+        output.push_back('-');
+      }
+      output.push_back('\n');
+    }
+    fwrite(output.data(), 1, output.size(), stdout);
+    total += hashes.size();
+  }
+  fflush(stdout);
+  std::cerr << "[fmsi2-access]"
+            << "\thashes=" << total << "\tinvalid=" << invalid << "\tnumber_of_hashes=" << index.mask_ones
+            << "\taccess_ns_per_kmer=" << (total ? 1e9 * seconds / total : 0) << std::endl;
+  return 0;
+}
+
 /// Print what an index file holds: its metadata, its sections, and the kLCP file next to it.
 int ms_info(int argc, char *argv[]) {
   bool check = false;
@@ -1123,6 +1239,7 @@ int main(int argc, char *argv[]) {
     if (op == "index") return ms_index2(argc - 1, argv + 1);
     if (op == "query") return ms_query2(argc - 1, argv + 1, false);
     if (op == "lookup") return ms_query2(argc - 1, argv + 1, true);
+    if (op == "access") return ms_access2(argc - 1, argv + 1);
     if (op == "info") return ms_info(argc - 1, argv + 1);
     if (op == "legacy") return legacy(argc - 1, argv + 1);
   } catch (const std::exception &error) {
