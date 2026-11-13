@@ -106,6 +106,17 @@ struct index {
         return 0;
     }
 
+    /// Whether a bit of the mask in [i, j) is set, for i < j, given the value returned by mask_prefetch(i).
+    inline bool mask_any(size_t i, size_t j, size_t hint) const {
+        if (mask_get(i, hint)) return true;
+        // Most intervals are short; a long one (a k-mer with many occurrences) costs two ranks, not a scan.
+        size_t stop = std::min(j, i + 4);
+        for (size_t q = i + 1; q < stop; ++q) {
+            if (mask_get(q)) return true;
+        }
+        return stop < j && mask_rank(stop) != mask_rank(j);
+    }
+
     /// Whether mask_prefetch() reads memory that should be prefetched itself, by mask_prefetch_directory().
     inline bool mask_has_directory() const { return mask_type == mask_kind::packed; }
 
@@ -138,7 +149,7 @@ inline void update_range(const index &ix, size_t &i, size_t &j, byte c) {
 /// The type of a mask. FMSI answers membership queries the fastest on a max-one mask (all occurrences of the
 /// k-mers of the set are set, so the first bit of an interval decides) and dictionary queries on a min-one mask
 /// (one set occurrence per k-mer, so the rank of the interval is a minimal perfect hash). FMSI 2 tests any mask
-/// so the type matters for the hashes only: with a mask other than min-one they stay unique
+/// in constant time, so the type matters for the hashes only: with a mask other than min-one they stay unique
 /// per set occurrence, but a k-mer set several times has several, and their range exceeds the number of k-mers.
 ///
 /// The type is computed from the rows that start with the same k-mer (mbwt::same_kmer). A k-mer and its reverse
@@ -684,9 +695,7 @@ void lookup_batch(const index &ix, const char *sequence, const uint32_t *offsets
                 s.hint = ix.mask_prefetch(s.i);
                 break;
             case MASK: {
-                bool represented = ix.mask_get(s.i, s.hint);
-                for (size_t q = s.i + 1; q < s.j && !represented; ++q) represented = ix.mask_get(q);
-                if (represented) {
+                if (ix.mask_any(s.i, s.j, s.hint)) {
                     out[s.offset] = hashes ? (out_t)ix.mask_rank(s.i) : (out_t)1;
                     ++found;
                     score = std::max(-7, std::min(7, score + (s.reverse ? -1 : 1)));
@@ -896,13 +905,9 @@ void lookup_streaming(const index &ix, const char *sequence, const segment *segm
     };
     // The interval is the one of a string starting with window x: resolve the window and go to the next one.
     auto check = [&](slot &s) {
-        size_t q = s.i;
-        if (!ix.mask_get(q, s.hint)) {
-            ++q;
-            while (q < s.j && !ix.mask_get(q)) ++q;
-        }
-        if (q < s.j) {
-            result(s, s.x) = hashes ? (out_t)ix.mask_rank(q) : (out_t)1;
+        if (ix.mask_any(s.i, s.j, s.hint)) {
+            // No bit is set between the start of the interval and its first set bit.
+            result(s, s.x) = hashes ? (out_t)ix.mask_rank(s.i) : (out_t)1;
             ++found;
             ++s.hits[s.reverse];
         } else if (!s.exact) {

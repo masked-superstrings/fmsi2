@@ -443,7 +443,7 @@ static int usage_query2(bool lookup) {
   std::cerr << "            [default: as the index file recommends]" << std::endl;
   std::cerr << "  -b INT  - number of k-mers (or sequences if -S) searched at the same time; 1 turns batching off [default: 32]" << std::endl;
   std::cerr << "  -p INT  - length of the patterns with tabulated SA intervals; 0 turns the table off [default: 10]" << std::endl;
-  std::cerr << "  -O      - accepted and ignored (the option of FMSI 1 for max-one masks; any mask is tested)" << std::endl;
+  std::cerr << "  -O      - accepted and ignored (the option of FMSI 1 for max-one masks; any mask is tested in constant time)" << std::endl;
   std::cerr << "  -k INT  - size of k-mers, checked against the index" << std::endl;
   std::cerr << std::endl;
   return 1;
@@ -704,7 +704,7 @@ int ms_query2(int argc, char *argv[], bool output_orders) {
       if (!parse_layout_option(c, optarg, layout)) return usage_query2(output_orders);
       break;
     case 'O':
-      // The option of FMSI 1 for max-one masks: not needed, as any mask is tested.
+      // The option of FMSI 1 for max-one masks: not needed, as any mask is tested in constant time.
       break;
     default:
       return usage_query2(output_orders);
