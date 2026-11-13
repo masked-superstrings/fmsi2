@@ -451,7 +451,7 @@ static int usage_query2(bool lookup) {
   std::cerr << "            [default: as the index file recommends]" << std::endl;
   std::cerr << "  -b INT  - number of k-mers (or sequences if -S) searched at the same time; 1 turns batching off [default: 32]" << std::endl;
   std::cerr << "  -p INT  - length of the patterns with tabulated SA intervals; 0 turns the table off [default: 10]" << std::endl;
-  std::cerr << "  -B INT  - number of bases in a block of sequences handed to a thread [default: 131072]" << std::endl;
+  std::cerr << "  -B INT  - size of a block of sequences handed to a thread, in bytes of the query file [default: 131072]" << std::endl;
   std::cerr << "  -O      - accepted and ignored (the option of FMSI 1 for max-one masks; any mask is tested in constant time)" << std::endl;
   std::cerr << "  -k INT  - size of k-mers, checked against the index" << std::endl;
   std::cerr << std::endl;
@@ -609,9 +609,7 @@ int run_query2(const fmsi2::index &index, std::string query_fn, unsigned batch_s
                size_t block_bases, fmsi2::query_stats &stats) {
   gzFile fp = OpenFile(query_fn);
   gzbuffer(fp, 1 << 18);
-  kseq_t *seq = kseq_init(fp);
-  bool ok = fmsi2::run_queries<hashes>(index, seq, stdout, streaming, batch_size, threads, block_bases, stats);
-  kseq_destroy(seq);
+  bool ok = fmsi2::run_queries<hashes>(index, fp, stdout, streaming, batch_size, threads, block_bases, stats);
   gzclose(fp);
   if (!ok) {
     std::cerr << "ERROR: Query sequences of 4 Gbp and more are not supported." << std::endl;
@@ -737,7 +735,8 @@ int ms_query2(int argc, char *argv[], bool output_orders) {
             << "\tloaded_rss_kb=" << loaded_bytes / 1000 << "\tload_peak_rss_kb=" << load_peak_bytes / 1000
             << "\tend_rss_kb=" << fmsi2::resident_bytes() / 1000 << "\tpeak_rss_kb=" << fmsi2::peak_resident_bytes() / 1000
             << "\tload_s=" << load_seconds << "\ttable_s=" << table_seconds
-            << "\tread_s=" << stats.read << "\tscan_s=" << stats.scan / threads
+            << "\tread_s=" << stats.read << "\tparse_s=" << stats.parse / threads
+            << "\tscan_s=" << stats.scan / threads
             << "\tsearch_s=" << stats.search / threads
             << "\tformat_s=" << stats.format / threads << "\twrite_s=" << stats.write
             << "\tsearch_ns_per_kmer=" << (lookups.kmers ? 1e9 * stats.search / threads / lookups.kmers : 0)
