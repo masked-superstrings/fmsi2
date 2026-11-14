@@ -8,6 +8,7 @@
 #include <string>
 #include <vector>
 
+#include "../src/doubled.h"
 #include "../src/fms_index2.h"
 #include "../src/index_file.h"
 #include "../src/parser.h"
@@ -442,19 +443,183 @@ TEST(FMS_INDEX2, ACCESS) {
     }
 }
 
+/// The MBWT of the doubled text (doubled.h) computed naively: the suffixes of X 0 Y sorted with the end of
+/// the text before the separator and the separator before the characters.
+mbwt naive_doubled_mbwt(const std::string &ms, size_t k) {
+    const size_t n = ms.size();
+    std::string upper = ms;
+    for (auto &c : upper) c = toupper(c);
+    // '!' is the separator; the end of the text sorts before it as the end of a string.
+    std::string text = upper + "!" + reverse_complement(upper);
+    auto rank = [](char c) { return c == '!' ? 0 : 1 + (int)nucleotideToInt[(uint8_t)c]; };
+    std::vector<size_t> sa(text.size() + 1);
+    for (size_t i = 0; i < sa.size(); ++i) sa[i] = i;
+    std::sort(sa.begin(), sa.end(), [&](size_t a, size_t b) {
+        for (;; ++a, ++b) {
+            if (b == text.size()) return false;
+            if (a == text.size()) return true;
+            if (text[a] != text[b]) return rank(text[a]) < rank(text[b]);
+        }
+    });
+    auto represented = [&](size_t p) {
+        if (p < n) return is_upper(ms[p]);
+        if (p == n || p == text.size()) return false;
+        size_t j = p - n - 1;
+        return j + k <= n && is_upper(ms[n - j - k]);
+    };
+    auto has_prefix = [&](size_t p) { return p + k - 1 <= n || (p > n && p + k - 1 <= text.size()); };
+    mbwt m;
+    m.bwt.resize(sa.size());
+    m.sa_transformed_mask = sdsl::bit_vector(sa.size(), 0);
+    m.klcp = sdsl::bit_vector(sa.size(), 0);
+    for (size_t i = 0; i < sa.size(); ++i) {
+        size_t p = sa[i];
+        if (p == 0) {
+            m.dollar_position = i;
+        } else if (p == n + 1) {
+            m.dollar_position2 = i;
+        } else {
+            m.bwt[i] = nucleotideToInt[(uint8_t)text[p - 1]];
+        }
+        m.sa_transformed_mask[i] = represented(p);
+        if (i + 1 < sa.size() && has_prefix(p) && has_prefix(sa[i + 1]) &&
+            text.compare(p, k - 1, text, sa[i + 1], k - 1) == 0) {
+            m.klcp[i] = 1;
+        }
+    }
+    return m;
+}
+
+void expect_same_mbwt(const mbwt &a, const mbwt &b, const std::string &where) {
+    ASSERT_EQ(a.bwt, b.bwt) << where;
+    ASSERT_EQ(a.sa_transformed_mask, b.sa_transformed_mask) << where;
+    ASSERT_EQ(a.klcp, b.klcp) << where;
+    ASSERT_EQ(a.dollar_position, b.dollar_position) << where;
+    ASSERT_EQ(a.dollar_position2, b.dollar_position2) << where;
+}
+
+/// The doubled text: its MBWT is the one of the suffixes sorted naively, and does not depend on the threads.
+TEST(FMS_INDEX2, DOUBLED_MATCHES_NAIVE) {
+    std::mt19937_64 rng(7);
+    size_t usual_chunk = parallel_chunk_items;
+    parallel_chunk_items = 64;
+    for (int round = 0; round < 40; ++round) {
+        size_t k = 2 + rng() % 31;
+        std::string ms = random_mask(rng, random_superstring(rng, k + rng() % (round < 20 ? 300 : 3000)), k, round % 2);
+        mbwt naive = naive_doubled_mbwt(ms, k);
+        for (unsigned threads : {1u, 3u}) {
+            mbwt m = doubled::compute_mbwt(ms, k, true, threads);
+            expect_same_mbwt(m, naive, "k " + std::to_string(k) + " round " + std::to_string(round));
+        }
+    }
+    parallel_chunk_items = usual_chunk;
+}
+
+/// With both strands indexed, membership agrees with the definition and with the index of one strand.
+TEST(FMS_INDEX2, FAST_MEMBERSHIP) {
+    std::mt19937_64 rng(8);
+    for (int round = 0; round < 40; ++round) {
+        size_t k = std::vector<size_t>{2, 3, 5, 11, 13, 31}[rng() % 6];
+        std::string ms = random_mask(rng, random_superstring(rng, k + rng() % 4000), k, round % 2);
+        auto represented = represented_kmers(ms, k);
+        queries q = make_queries(rng, ms, k);
+        for (auto mask_type : {fmsi2::mask_kind::plain, fmsi2::mask_kind::packed, fmsi2::mask_kind::rrr}) {
+            mbwt m = doubled::compute_mbwt(ms, k, (round / 2 + (int)mask_type) % 2);
+            fmsi2::index index;
+            fmsi2::build(index, m, k, mask_type, 64 << (round % 3));
+            ASSERT_EQ(index.strands, 2u);
+            for (unsigned table : {0, 2, 10}) {
+                fmsi2::build_prefix_table(index, table);
+                for (unsigned batch : {1, 3, 32}) {
+                    fmsi2::lookup_stats stats;
+                    std::vector<int8_t> single(q.sequences.size(), 0), streamed(q.sequences.size(), 0);
+                    fmsi2::lookup_batch<false, int8_t>(index, q.sequences.data(), q.offsets.data(), q.offsets.size(),
+                                                       single.data(), batch, stats);
+                    fmsi2::lookup_streaming<false, int8_t>(index, q.sequences.data(), q.segments.data(),
+                                                           q.segments.size(), streamed.data(), batch, stats);
+                    for (uint32_t offset : q.offsets) {
+                        bool want = represented.count(canonical(q.sequences.substr(offset, k)));
+                        ASSERT_EQ((bool)single[offset], want) << "k " << k << " round " << round;
+                        ASSERT_EQ((bool)streamed[offset], want) << "k " << k << " round " << round << " (streaming)";
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// With both strands indexed and one set occurrence per k-mer, the hashes are a bijection from the represented
+/// k-mers in both orientations to [0, 2 * number of k-mers), and access inverts them.
+TEST(FMS_INDEX2, FAST_HASHES_AND_ACCESS) {
+    std::mt19937_64 rng(9);
+    for (int round = 0; round < 30; ++round) {
+        size_t k = std::vector<size_t>{3, 5, 13, 31}[rng() % 4];
+        std::string ms = random_mask(rng, random_superstring(rng, k + rng() % 4000), k, true);
+        auto represented = represented_kmers(ms, k);
+        queries q = make_queries(rng, ms, k);
+
+        mbwt m = doubled::compute_mbwt(ms, k, round / 9 % 2);
+        fmsi2::index index;
+        fmsi2::build(index, m, k, (fmsi2::mask_kind)(round % 3), 64 << (round / 3 % 3));
+        fmsi2::build_prefix_table(index, round % 3 * 4);
+        ASSERT_EQ(index.mask_ones, 2 * represented.size()) << "k " << k << " round " << round;
+        fmsi2::lookup_stats stats;
+        std::vector<int64_t> single(q.sequences.size(), -1), streamed(q.sequences.size(), -1);
+        fmsi2::lookup_batch<true, int64_t>(index, q.sequences.data(), q.offsets.data(), q.offsets.size(),
+                                           single.data(), 7, stats);
+        fmsi2::lookup_streaming<true, int64_t>(index, q.sequences.data(), q.segments.data(), q.segments.size(),
+                                               streamed.data(), 7, stats);
+        std::map<std::string, int64_t> hash_of;
+        std::set<int64_t> hashes;
+        for (uint32_t offset : q.offsets) {
+            std::string kmer = q.sequences.substr(offset, k);
+            ASSERT_EQ(single[offset], streamed[offset]) << "k " << k << " round " << round;
+            if (!represented.count(canonical(kmer))) {
+                ASSERT_EQ(single[offset], -1);
+                continue;
+            }
+            ASSERT_GE(single[offset], 0);
+            ASSERT_LT(single[offset], 2 * (int64_t)represented.size());
+            auto inserted = hash_of.insert({kmer, single[offset]});
+            ASSERT_EQ(inserted.first->second, single[offset]) << "a k-mer has two hashes";
+            hashes.insert(single[offset]);
+            // Access gives the k-mer back, as it is.
+            std::string accessed(k, 0);
+            fmsi2::access(index, single[offset], accessed.data());
+            ASSERT_EQ(accessed, kmer) << "k " << k << " round " << round;
+        }
+        // The superstring and its reverse complement are among the queries, so all k-mers were looked up.
+        EXPECT_EQ(hash_of.size(), 2 * represented.size());
+        EXPECT_EQ(hashes.size(), 2 * represented.size());
+        if (round % 2) fmsi2::build_access_support(index);
+        std::vector<uint64_t> all(index.mask_ones);
+        for (size_t h = 0; h < all.size(); ++h) all[h] = h;
+        std::string batched(all.size() * k, 0);
+        fmsi2::access_batch(index, all.data(), all.size(), batched.data(), 5);
+        for (size_t h = 0; h < all.size(); ++h) {
+            std::string kmer = batched.substr(h * k, k);
+            ASSERT_TRUE(hash_of.count(kmer)) << "k " << k << " round " << round;
+            ASSERT_EQ(hash_of[kmer], (int64_t)h);
+        }
+    }
+}
+
 TEST(FMS_INDEX2, SAVE_AND_LOAD) {
     std::mt19937_64 rng(6);
     size_t k = 13;
     std::string ms = random_mask(rng, random_superstring(rng, 3000), k, true);
     queries q = make_queries(rng, ms, k);
-    for (auto mask_type : {fmsi2::mask_kind::plain, fmsi2::mask_kind::packed, fmsi2::mask_kind::rrr}) {
-        mbwt m = compute_mbwt<uint64_t>(ms, k, false);
+    for (int variant = 0; variant < 6; ++variant) {
+        auto mask_type = (fmsi2::mask_kind)(variant % 3);
+        mbwt m = variant < 3 ? compute_mbwt<uint64_t>(ms, k, false) : doubled::compute_mbwt(ms, k, false);
         fmsi2::index built, loaded;
         fmsi2::build(built, m, k, mask_type, mask_type == fmsi2::mask_kind::plain ? 128 : 256);
         std::string path = testing::TempDir() + "fmsi2_test.fmsi";
         fmsi2::save(built, path);
         fmsi2::load(loaded, path);
         std::filesystem::remove(path);
+        EXPECT_EQ(built.strands, loaded.strands);
+        EXPECT_EQ(built.dollar_position2, loaded.dollar_position2);
         fmsi2::build_prefix_table(built, 6);
         fmsi2::build_prefix_table(loaded, 6);
         fmsi2::lookup_stats stats;
@@ -480,16 +645,18 @@ std::vector<int64_t> hashes_of(fmsi2::index &index, const queries &q) {
 TEST(FMS_INDEX2, FILE_LAYOUTS) {
     std::mt19937_64 rng(7);
     const std::string path = testing::TempDir() + "fmsi2_layouts_test.fmsi";
-    for (int round = 0; round < 4; ++round) {
+    for (int round = 0; round < 8; ++round) {
         size_t k = std::vector<size_t>{3, 13, 31, 33}[round % 4];
         std::string ms = random_mask(rng, random_superstring(rng, k + 100 + rng() % 70000), k, round % 2);
         queries q = make_queries(rng, ms, k);
+        const bool both = round >= 4;
         mbwt_with_same_kmer = true;
-        mbwt m = k <= 32 ? compute_mbwt<uint64_t>(ms, k, true) : compute_mbwt<__uint128_t>(ms, k, true);
+        mbwt m = both ? doubled::compute_mbwt(ms, k, true) : k <= 32 ? compute_mbwt<uint64_t>(ms, k, true) : compute_mbwt<__uint128_t>(ms, k, true);
         mbwt_with_same_kmer = false;
         const sdsl::bit_vector klcp = m.klcp;
         const fmsi2::mask_statistics statistics = fmsi2::classify_mask(m);
-        const fmsi2::description d = fmsi2::save_mbwt(m, k, fmsi2::default_layout(), statistics, path, 1 + round % 3);
+        const fmsi2::description d = fmsi2::save_mbwt(m, k, both ? "fast" : "small", fmsi2::preset_layout(both ? "fast" : "small"),
+                                                      statistics, path, 1 + round % 3);
         fmsi2::save_klcp_bits(klcp, k, d.uid(), path + ".klcp", 1 + round % 3);
         fmsi2::index built;
         fmsi2::build(built, m, k, fmsi2::mask_kind::plain);
@@ -503,10 +670,12 @@ TEST(FMS_INDEX2, FILE_LAYOUTS) {
                 fmsi2::index loaded;
                 fmsi2::load(loaded, path, 1 + (block_bytes / 64) % 3, layout);
                 ASSERT_EQ(loaded.k, k);
+                ASSERT_EQ(loaded.strands, both ? 2u : 1u);
                 ASSERT_EQ(loaded.size, built.size);
                 ASSERT_EQ(loaded.mask_ones, built.mask_ones);
+                ASSERT_EQ(loaded.preset, both ? "fast" : "small");
                 ASSERT_EQ(loaded.mask_type_name, statistics.type);
-                // The recommended layout is the fastest one.
+                // The recommended layout is that of the preset: the fastest one.
                 if (block_bytes == 0) ASSERT_EQ(loaded.bwt.block_bytes(), 64u);
                 if (mask < 0) ASSERT_EQ(loaded.mask_type, fmsi2::mask_kind::plain);
                 for (size_t i = 0; i < loaded.size; i += 1 + rng() % 7) ASSERT_EQ(loaded.mask_get(i), built.mask_get(i)) << "row " << i;
@@ -542,7 +711,7 @@ TEST(FMS_INDEX2, FILE_SECTIONS) {
     mbwt m = compute_mbwt<uint64_t>(ms, k, true);
     const sdsl::bit_vector klcp = m.klcp;
     const std::string path = testing::TempDir() + "fmsi2_sections_test.fmsi";
-    const fmsi2::description d = fmsi2::save_mbwt(m, k, fmsi2::default_layout(), fmsi2::mask_statistics(), path);
+    const fmsi2::description d = fmsi2::save_mbwt(m, k, "small", fmsi2::preset_layout("small"), fmsi2::mask_statistics(), path);
     fmsi2::index reference;
     fmsi2::load(reference, path);
     const std::vector<int64_t> want = hashes_of(reference, q);
@@ -585,7 +754,7 @@ TEST(FMS_INDEX2, FILE_SECTIONS) {
     {
         std::string other = random_mask(rng, random_superstring(rng, ms.size()), k, true);
         mbwt n = compute_mbwt<uint64_t>(other, k, true);
-        const fmsi2::description e = fmsi2::save_mbwt(n, k, fmsi2::default_layout(), fmsi2::mask_statistics(), path + ".other");
+        const fmsi2::description e = fmsi2::save_mbwt(n, k, "small", fmsi2::preset_layout("small"), fmsi2::mask_statistics(), path + ".other");
         fmsi2::save_klcp_bits(n.klcp, k, e.uid(), path + ".other.klcp");
         fmsi2::save_klcp_bits(klcp, k, d.uid(), path + ".klcp");
         ASSERT_NE(d.uid(), e.uid());
@@ -637,20 +806,20 @@ TEST(FMS_INDEX2, FILE_SECTIONS) {
 /// The type of the mask that the constructions compute, against its definition.
 TEST(FMS_INDEX2, MASK_TYPE) {
     std::mt19937_64 rng(9);
-    auto computed = [&](const std::string &ms, size_t k) {
+    auto computed = [&](const std::string &ms, size_t k, bool both) {
         mbwt_with_same_kmer = true;
         std::string copy = ms;
-        mbwt m = compute_mbwt<uint64_t>(copy, k, false, false, 1 + rng() % 3);
+        mbwt m = both ? doubled::compute_mbwt(copy, k, false, 1 + rng() % 3) : compute_mbwt<uint64_t>(copy, k, false, false, 1 + rng() % 3);
         mbwt_with_same_kmer = false;
         return fmsi2::classify_mask(m);
     };
-    // By the definition: the occurrences and the set occurrences of every k-mer.
-    auto defined = [&](const std::string &ms, size_t k) {
+    // By the definition: the occurrences and the set occurrences of every k-mer, of both strands if [canonical].
+    auto defined = [&](const std::string &ms, size_t k, bool canonical_kmers) {
         std::map<std::string, std::pair<size_t, size_t>> seen;
         for (size_t i = 0; i + k <= ms.size(); ++i) {
             std::string kmer = ms.substr(i, k);
             for (auto &c : kmer) c = toupper(c);
-            auto &entry = seen[kmer];
+            auto &entry = seen[canonical_kmers ? canonical(kmer) : kmer];
             entry.first++;
             entry.second += is_upper(ms[i]);
         }
@@ -690,23 +859,26 @@ TEST(FMS_INDEX2, MASK_TYPE) {
             break;
         }
         }
-        const fmsi2::mask_statistics got = computed(ms, k);
-        const auto want = defined(ms, k);
-        ASSERT_EQ(got.source, "computed-one-strand");
-        ASSERT_EQ(got.type, want.first) << ms << " k " << k;
-        // A stated type is kept if the mask does not contradict it, and replaced with a warning if it does.
-        for (const std::string stated : {"min-one", "max-one"}) {
-            const fmsi2::mask_statistics by_header = fmsi2::decide_mask_type(got, "auto", stated);
-            const fmsi2::mask_statistics by_user = fmsi2::decide_mask_type(got, stated, stated == "min-one" ? "max-one" : "");
-            const bool holds = stated == "min-one" ? got.single : got.uniform;
-            ASSERT_EQ(by_header.warning.empty(), holds);
-            ASSERT_EQ(by_header.source, holds ? "header" : got.source);
-            ASSERT_EQ(by_user.source, holds ? "declared" : got.source);
-            ASSERT_EQ(by_header.type, holds ? stated : got.type);
-            ASSERT_EQ(by_user.type, holds ? stated : got.type);
+        for (bool both : {false, true}) {
+            const fmsi2::mask_statistics got = computed(ms, k, both);
+            const auto want = defined(ms, k, both);
+            ASSERT_EQ(got.source, both ? "computed" : "computed-one-strand");
+            ASSERT_EQ(got.type, want.first) << ms << " k " << k << " both " << both;
+            // A stated type is kept if the mask does not contradict it, and replaced with a warning if it does.
+            for (const std::string stated : {"min-one", "max-one"}) {
+                const fmsi2::mask_statistics by_header = fmsi2::decide_mask_type(got, "auto", stated);
+                const fmsi2::mask_statistics by_user = fmsi2::decide_mask_type(got, stated, stated == "min-one" ? "max-one" : "");
+                const bool holds = stated == "min-one" ? got.single : got.uniform;
+                ASSERT_EQ(by_header.warning.empty(), holds);
+                ASSERT_EQ(by_header.source, holds ? "header" : got.source);
+                ASSERT_EQ(by_user.source, holds ? "declared" : got.source);
+                const std::string kept = both && got.single && got.uniform ? "min-one,max-one" : stated;
+                ASSERT_EQ(by_header.type, holds ? kept : got.type);
+                ASSERT_EQ(by_user.type, holds ? kept : got.type);
+            }
+            if (!both) ASSERT_EQ(got.kmers, want.second) << ms;
+            seen_types[got.type]++;
         }
-        ASSERT_EQ(got.kmers, want.second) << ms;
-        seen_types[got.type]++;
     }
     // All four types occurred.
     ASSERT_EQ(seen_types.size(), 4u);

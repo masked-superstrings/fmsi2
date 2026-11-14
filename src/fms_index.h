@@ -444,7 +444,13 @@ struct mbwt {
     /// Optional, for finding out the type of the mask (mbwt_with_same_kmer): bit i is set iff the suffixes of
     /// the rows i and i + 1 start with the same k-mer.
     sdsl::bit_vector same_kmer;
+    /// With same_kmer, for a text of both strands and an even k: bit i is set iff the k-mer of row i is its own
+    /// reverse complement; its occurrences in the superstring then appear twice among the rows.
+    sdsl::bit_vector palindrome;
     size_t dollar_position = 0;
+    /// The row of the second sentinel, if the text has two (the doubled text of FMSI 2 --fast), or NO_ROW.
+    static constexpr size_t NO_ROW = ~(size_t)0;
+    size_t dollar_position2 = NO_ROW;
 };
 
 /// Whether the constructions of the MBWT also fill mbwt::same_kmer (one more bit per row while constructing).

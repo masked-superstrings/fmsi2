@@ -36,11 +36,22 @@ enum class mask_kind : uint32_t {
     packed = 2,
 };
 
+/// A position that is not a row.
+static constexpr uint64_t NO_ROW = ~(uint64_t)0;
+
 struct index {
     uint32_t k = 0;
-    /// Length of the BWT, i.e., the length of the superstring plus one.
+    /// Number of strands of the superstring indexed: 1, or 2 if its reverse complement is indexed too
+    /// (fmsi2 index --fast), in which case a k-mer is searched as it is and not as its reverse complement.
+    uint32_t strands = 1;
+    /// Length of the BWT, i.e., the number of suffixes including the empty one.
     uint64_t size = 0;
+    /// Rows whose BWT symbol is a sentinel (stored as A): the one before the text and, if the text consists
+    /// of two strings (the superstring and its reverse complement), the one between them; else NO_ROW.
     uint64_t dollar_position = 0;
+    uint64_t dollar_position2 = NO_ROW;
+    /// counts[c] is the number of suffixes starting with a symbol smaller than c, including those starting
+    /// with a sentinel (the empty suffix and, with two strings, the one starting with the separator).
     uint64_t counts[4] = {0, 0, 0, 0};
     quad_sequence bwt;
     mask_kind mask_type = mask_kind::plain;
@@ -62,8 +73,12 @@ struct index {
     /// the mask, i.e., of hashes.
     uint64_t dollar_rank = 0;
     uint64_t mask_ones = 0;
+    /// The same for the second sentinel (NO_ROW if there is none); the sentinels ordered by their rows.
+    uint64_t dollar_rank2 = NO_ROW;
 
-    /// The identifier of the content of the index (0 if unknown), by which its kLCP file is recognized.
+    /// The preset the index was built with ("small" or "fast", "" if unknown) and the identifier of its content
+    /// (0 if unknown), by which its kLCP file is recognized.
+    std::string preset;
     uint64_t uid = 0;
     /// The type of the mask as the index file states it: "min-one" (every k-mer of the set has one set
     /// occurrence, so that lookup is a minimal perfect hash), "max-one" (all occurrences of the k-mers of the
@@ -178,19 +193,28 @@ struct index {
     }
 };
 
+/// Number of sentinels among the first i symbols of the BWT (they are stored as A).
+inline size_t dollars_before(const index &ix, size_t i) {
+    return (size_t)(i > ix.dollar_position) + (size_t)(i > ix.dollar_position2);
+}
+
 /// Go from range (i,j) for pattern P to range for c+P.
 inline void update_range(const index &ix, size_t &i, size_t &j, byte c) {
     size_t count = ix.counts[c];
     size_t rank_i, rank_j;
     ix.bwt.rank_pair(i, j, c, rank_i, rank_j);
-    // The dollar is stored as A in the BWT.
-    i = count + rank_i - (c == 0 && i > ix.dollar_position);
-    j = count + rank_j - (c == 0 && j > ix.dollar_position);
+    // The sentinels are stored as A in the BWT.
+    size_t dollars_i = c == 0 ? dollars_before(ix, i) : 0, dollars_j = c == 0 ? dollars_before(ix, j) : 0;
+    i = count + rank_i - dollars_i;
+    j = count + rank_j - dollars_j;
 }
 
 /// Set what access needs beyond the stored index and costs nothing.
 inline void prepare_access(index &ix) {
-    ix.dollar_rank = ix.bwt.rank(ix.dollar_position, 0);
+    uint64_t first = std::min(ix.dollar_position, ix.dollar_position2);
+    uint64_t second = std::max(ix.dollar_position, ix.dollar_position2);
+    ix.dollar_rank = ix.bwt.rank(first, 0);
+    ix.dollar_rank2 = second == NO_ROW ? NO_ROW : ix.bwt.rank(second, 0);
     ix.mask_ones = ix.mask_rank(ix.size);
 }
 
@@ -205,15 +229,17 @@ inline void build_access_support(index &ix) { ix.bwt.build_select_hints(); }
 /// in constant time, so the type matters for the hashes only: with a mask other than min-one they stay unique
 /// per set occurrence, but a k-mer set several times has several, and their range exceeds the number of k-mers.
 ///
-/// The type is computed from the rows that start with the same k-mer (mbwt::same_kmer). A k-mer and its reverse
-/// complement are not related to each other there: a mask found min-one may still set a k-mer once in each
-/// orientation (masks of KmerCamel in its bidirectional mode never do). The type that the producer of the masked
-/// superstring states in its FASTA header (mask=min-one) or the user gives is therefore preferred, and what is
-/// computed checks it.
+/// The type is computed from the rows that start with the same k-mer (mbwt::same_kmer). For an index of both
+/// strands these hold the occurrences of a k-mer and of its reverse complement, so the type is exact. For an
+/// index of one strand a k-mer and its reverse complement are not related to each other: a mask found min-one
+/// may still set a k-mer once in each orientation (masks of KmerCamel in its bidirectional mode never do). The
+/// type that the producer of the masked superstring states in its FASTA header (mask=min-one) or the user gives
+/// is therefore preferred, and what is computed checks it.
 struct mask_statistics {
     /// "min-one", "max-one", "min-one,max-one" (each k-mer of the set occurs once), "other" or "unknown".
     std::string type = "unknown";
-    /// "computed-one-strand", "header" (of the masked superstring), "declared" (by the user), or empty.
+    /// "computed" (exact: both strands), "computed-one-strand", "header" (of the masked superstring),
+    /// "declared" (by the user), or empty.
     std::string source;
     /// Whether the type was computed, and what was found: no k-mer with several set occurrences; no k-mer of
     /// the set with an unset occurrence.
@@ -231,13 +257,16 @@ inline mask_statistics classify_mask(const mbwt &m) {
     bool single = true, uniform = true;
     uint64_t ones = 0, length = 0;
     const size_t rows = m.bwt.size();
+    const bool palindromes = m.palindrome.size() == rows;
     for (size_t i = 0; i < rows; ++i) {
         ones += m.sa_transformed_mask[i];
         ++length;
         if (!m.same_kmer[i]) {
             if (ones > 0) {
                 ++result.kmers;
-                single = single && ones == 1;
+                // A k-mer that is its own reverse complement occurs twice among the rows of both strands.
+                const uint64_t once = palindromes && m.palindrome[i] ? 2 : 1;
+                single = single && ones == once;
                 uniform = uniform && ones == length;
             }
             ones = length = 0;
@@ -247,7 +276,7 @@ inline mask_statistics classify_mask(const mbwt &m) {
     result.single = single;
     result.uniform = uniform;
     result.type = single && uniform ? "min-one,max-one" : single ? "min-one" : uniform ? "max-one" : "other";
-    result.source = "computed-one-strand";
+    result.source = m.dollar_position2 == mbwt::NO_ROW ? "computed-one-strand" : "computed";
     return result;
 }
 
@@ -265,7 +294,9 @@ inline mask_statistics decide_mask_type(mask_statistics computed, const std::str
                            "; its type is recorded as " + computed.type;
         return computed;
     }
-    computed.type = stated;
+    // Exactly known to be both: each k-mer of the set occurs once.
+    const bool both = computed.computed && computed.source == "computed" && computed.single && computed.uniform;
+    computed.type = both ? "min-one,max-one" : stated;
     computed.source = by_user ? "declared" : "header";
     return computed;
 }
@@ -275,6 +306,10 @@ void build(index &ix, mbwt &m, int k, mask_kind mask_type, uint32_t bwt_block_by
     ix.k = k;
     ix.size = m.bwt.size();
     ix.dollar_position = m.dollar_position;
+    ix.dollar_position2 = m.dollar_position2 == mbwt::NO_ROW ? NO_ROW : m.dollar_position2;
+    // A second sentinel separates the superstring from its reverse complement (doubled.h).
+    ix.strands = ix.dollar_position2 == NO_ROW ? 1 : 2;
+    ix.preset = ix.strands == 2 ? "fast" : "small";
     const mask_statistics statistics = classify_mask(m);
     ix.mask_type_name = statistics.type == "unknown" ? "" : statistics.type;
     ix.mask_type_source = statistics.source;
@@ -298,8 +333,8 @@ void build(index &ix, mbwt &m, int k, mask_kind mask_type, uint32_t bwt_block_by
     ix.bwt.finalize(threads);
     m.bwt = std::vector<byte>();
     build_phases.lap("pack_bwt");
-    // The count of A includes the dollar, which stands for the smallest suffix.
-    ix.counts[0] = 1;
+    // The count of A includes the sentinels, which stand for the smallest suffixes.
+    ix.counts[0] = 1 + (ix.dollar_position2 != NO_ROW);
     ix.counts[1] = totals[0];
     ix.counts[2] = totals[0] + totals[1];
     ix.counts[3] = totals[0] + totals[1] + totals[2];
@@ -327,7 +362,7 @@ void build(index &ix, mbwt &m, int k, mask_kind mask_type, uint32_t bwt_block_by
 }
 
 /// The layout of an index in memory. It is chosen when the index is loaded, as the file holds the BWT and the
-/// mask in a form of its own; the file recommends one.
+/// mask in a form of its own; the file recommends one (that of its preset).
 struct layout {
     /// Bytes per block of the BWT (64, 128 or 256); 0 stands for the recommended one.
     uint32_t bwt_block_bytes = 0;
@@ -335,9 +370,9 @@ struct layout {
     int mask = -1;
 };
 
-/// The layout that a file recommends unless fmsi2 index is told otherwise (-c, -m): the one that answers the
-/// fastest (blocks of 64 bytes, i.e. one cache line per rank, and the plain mask).
-inline layout default_layout() {
+/// The layout of the presets: --small and --fast answer the fastest (blocks of 64 bytes, i.e. one cache line per
+/// rank, and the plain mask); --small indexes the superstring, --fast also its reverse complement.
+inline layout preset_layout(const std::string &preset) {
     layout result;
     result.bwt_block_bytes = 64;
     result.mask = (int)mask_kind::plain;
@@ -364,7 +399,7 @@ inline bool parse_mask_name(const std::string &name, mask_kind &kind) {
 /// Format 2 (index_file.h): one file with tagged sections. The sections of an index:
 ///   META  text, key=value per line (below)
 ///   BWT   encoding 1: the characters of the BWT, 2 bits each, 4 per byte (character i at bits 2 (i % 4) of
-///         byte i / 4), the sentinel stored as A; not compressed, as it does not compress
+///         byte i / 4), the sentinels stored as A; not compressed, as it does not compress
 ///   MASK  encoding 1: the mask in the order of the suffix array, one bit per row (bit i at bit i % 8 of byte
 ///         i / 8); compressed
 /// The kLCP array is a file of its own (<index file>.klcp) with META and
@@ -373,8 +408,9 @@ inline bool parse_mask_name(const std::string &name, mask_kind &kind) {
 /// The rank counts of the BWT and of the mask, the table of the first search steps and the hints of select
 /// are not stored: they are computed when the file is loaded, in the layout asked for.
 ///
-/// Keys of META of an index: kind (index), creator, k, rows (the length of the BWT), dollar (the row of the
-/// sentinel), counts (the four cumulative character counts), mask_ones, mask_order (sa), layout (the recommended
+/// Keys of META of an index: kind (index), creator, k, strands (1; 2 if the reverse complement of the superstring
+/// is indexed too), preset (small, fast), rows (the length of the BWT), dollar and dollar2 (the rows of the
+/// sentinels), counts (the four cumulative character counts), mask_ones, mask_order (sa), layout (the recommended
 /// layout in memory: bytes per block of the BWT and the mask encoding), uid (an identifier of the content, which
 /// the kLCP file repeats as index_uid). Unknown keys are ignored.
 static const uint32_t ENCODING_BWT_PACKED = 1;
@@ -395,10 +431,13 @@ inline sdsl::bit_vector mask_bits(const index &ix) {
 /// What a file says about its index besides the BWT and the mask.
 struct description {
     uint32_t k = 0;
+    uint32_t strands = 1;
     uint64_t rows = 0;
     uint64_t dollar_position = 0;
+    uint64_t dollar_position2 = NO_ROW;
     uint64_t counts[4] = {0, 0, 0, 0};
     uint64_t mask_ones = 0;
+    std::string preset;
     layout recommended;
     /// The type of the mask and how it is known (mask_statistics), and the FASTA header of the masked superstring.
     std::string mask_type, mask_type_source, superstring_header;
@@ -413,8 +452,10 @@ struct description {
             }
         };
         mix(k);
+        mix(strands);
         mix(rows);
         mix(dollar_position);
+        mix(dollar_position2);
         for (int c = 0; c < 4; ++c) mix(counts[c]);
         mix(mask_ones);
         return hash;
@@ -438,8 +479,11 @@ inline void write_index_file(const std::string &path, const description &d,
     meta.set("kind", "index");
     meta.set("creator", creator());
     meta.set("k", d.k);
+    meta.set("strands", d.strands);
+    meta.set("preset", d.preset);
     meta.set("rows", d.rows);
     meta.set("dollar", d.dollar_position);
+    if (d.dollar_position2 != NO_ROW) meta.set("dollar2", d.dollar_position2);
     meta.set("counts", std::to_string(d.counts[0]) + "," + std::to_string(d.counts[1]) + "," + std::to_string(d.counts[2]) +
                            "," + std::to_string(d.counts[3]));
     meta.set("mask_ones", d.mask_ones);
@@ -468,12 +512,15 @@ inline void bit_vector_bytes(const sdsl::bit_vector &bits, uint64_t begin, uint6
 }
 
 /// Write the index of an MBWT to a file, without building the index in memory. Returns its description.
-inline description save_mbwt(const mbwt &m, int k, layout recommended, const mask_statistics &statistics,
+inline description save_mbwt(const mbwt &m, int k, const std::string &preset, layout recommended, const mask_statistics &statistics,
                              const std::string &path, unsigned threads = 1, const std::string &superstring_header = "") {
     description d;
     d.k = k;
     d.rows = m.bwt.size();
     d.dollar_position = m.dollar_position;
+    d.dollar_position2 = m.dollar_position2 == mbwt::NO_ROW ? NO_ROW : m.dollar_position2;
+    d.strands = d.dollar_position2 == NO_ROW ? 1 : 2;
+    d.preset = preset;
     d.recommended = recommended;
     d.mask_type = statistics.type;
     d.mask_type_source = statistics.source;
@@ -490,8 +537,8 @@ inline description save_mbwt(const mbwt &m, int k, layout recommended, const mas
     for (const auto &part : counted) {
         for (int c = 0; c < 4; ++c) totals[c] += part[c];
     }
-    // The count of A includes the sentinel, which stands for the smallest suffix.
-    d.counts[0] = 1;
+    // The count of A includes the sentinels, which stand for the smallest suffixes.
+    d.counts[0] = 1 + (d.dollar_position2 != NO_ROW);
     d.counts[1] = totals[0];
     d.counts[2] = totals[0] + totals[1];
     d.counts[3] = totals[0] + totals[1] + totals[2];
@@ -513,10 +560,13 @@ inline description save_mbwt(const mbwt &m, int k, layout recommended, const mas
 inline description describe(const index &ix) {
     description d;
     d.k = ix.k;
+    d.strands = ix.strands;
     d.rows = ix.size;
     d.dollar_position = ix.dollar_position;
+    d.dollar_position2 = ix.dollar_position2;
     for (int c = 0; c < 4; ++c) d.counts[c] = ix.counts[c];
     d.mask_ones = ix.mask_ones;
+    d.preset = ix.preset;
     d.recommended.bwt_block_bytes = ix.bwt.block_bytes();
     d.recommended.mask = (int)ix.mask_type;
     d.mask_type = ix.mask_type_name;
@@ -559,9 +609,12 @@ inline description read_description(const file::reader &in) {
     if (meta.get("kind") != "index") throw std::invalid_argument("file " + in.path() + " is not an index of FMSI 2");
     description d;
     d.k = (uint32_t)meta.number("k");
+    d.strands = (uint32_t)meta.number("strands", 1);
     d.rows = meta.number("rows");
     d.dollar_position = meta.number("dollar");
+    d.dollar_position2 = meta.number("dollar2", NO_ROW);
     d.mask_ones = meta.number("mask_ones");
+    d.preset = meta.get("preset");
     d.mask_type = meta.get("mask_type", "unknown");
     d.mask_type_source = meta.get("mask_type_source");
     d.superstring_header = meta.get("superstring_header");
@@ -571,7 +624,7 @@ inline description read_description(const file::reader &in) {
         if (!std::getline(counts, item, ',')) throw std::invalid_argument("file " + in.path() + " has no character counts");
         d.counts[c] = std::stoull(item);
     }
-    d.recommended = default_layout();
+    d.recommended = preset_layout(d.preset);
     const std::string recommended = meta.get("layout");
     const size_t comma = recommended.find(',');
     if (comma != std::string::npos) {
@@ -580,6 +633,7 @@ inline description read_description(const file::reader &in) {
         if (quad_sequence::valid_block_bytes(block_bytes)) d.recommended.bwt_block_bytes = block_bytes;
         if (parse_mask_name(recommended.substr(comma + 1), kind)) d.recommended.mask = (int)kind;
     }
+    if (d.strands != 1 && d.strands != 2) throw std::invalid_argument("file " + in.path() + " has an unsupported number of strands");
     if (meta.get("mask_order", "sa") != "sa") {
         throw std::invalid_argument("file " + in.path() + " stores its mask in an order that this version of FMSI does not know");
     }
@@ -594,9 +648,12 @@ inline void load(index &ix, const std::string &path, unsigned threads = 1, layou
     in.check_known({"META", "BWT", "MASK"});
     const description d = read_description(in);
     ix.k = d.k;
+    ix.strands = d.strands;
     ix.size = d.rows;
     ix.dollar_position = d.dollar_position;
+    ix.dollar_position2 = d.dollar_position2;
     for (int c = 0; c < 4; ++c) ix.counts[c] = d.counts[c];
+    ix.preset = d.preset;
     ix.uid = d.uid();
     ix.mask_type_name = d.mask_type == "unknown" ? "" : d.mask_type;
     ix.mask_type_source = d.mask_type_source;
@@ -731,7 +788,9 @@ struct lookup_stats {
 
 /// Look up the k-mers starting at the given offsets of the sequence, [batch_size] of them at a time.
 /// For each k-mer, out[offset] is set to its presence (0/1), or to its hash (-1 if absent) if [hashes].
-/// A k-mer is represented if the k-mer or its reverse complement has an occurrence set in the mask.
+/// A k-mer is represented if the k-mer or its reverse complement has an occurrence set in the mask; if
+/// the index holds both strands, the k-mer itself is searched only, and the hashes are those of the k-mers
+/// as they are (a k-mer and its reverse complement have different hashes).
 template <bool hashes, typename out_t>
 void lookup_batch(const index &ix, const char *sequence, const uint32_t *offsets, size_t count, out_t *out,
                   unsigned batch_size, lookup_stats &stats) {
@@ -758,6 +817,8 @@ void lookup_batch(const index &ix, const char *sequence, const uint32_t *offsets
     // Saturating counter predicting the strand of the next k-mer from the previous hits.
     int score = 0;
     uint64_t found = 0, steps = 0, searches = 0;
+    // With both strands indexed, a k-mer is searched as it is only.
+    const bool one_strand = ix.strands == 2;
 
     auto begin_strand = [&](slot &s) {
         ++searches;
@@ -786,12 +847,12 @@ void lookup_batch(const index &ix, const char *sequence, const uint32_t *offsets
         }
         s.offset = offsets[next++];
         s.kmer = sequence + s.offset;
-        s.reverse = score < 0;
+        s.reverse = !one_strand && score < 0;
         s.second = 0;
         begin_strand(s);
     };
     auto strand_failed = [&](slot &s) {
-        if (s.second) {
+        if (s.second || one_strand) {
             out[s.offset] = hashes ? -1 : 0;
             load(s);
         } else {
@@ -872,7 +933,8 @@ struct segment {
 /// Look up all k-mers of the segments by streaming, [batch_size] segments at a time; the results
 /// are as in lookup_batch (out must be initialized to 0, or to -1 if [hashes]).
 ///
-/// A segment is searched on one strand and the k-mers not found there on the other one. On a strand,
+/// A segment is searched on one strand and the k-mers not found there on the other one (if the index holds
+/// both strands, on the strand of the query only). On a strand,
 /// the k-mers (windows) are resolved from the right to the left: the match of a window is extended by one
 /// character to the match of the next one, so the match can get longer than k. A longer match has a
 /// subset of the occurrences of the k-mer, hence a set mask bit proves the k-mer represented, while an
@@ -926,6 +988,8 @@ void lookup_streaming(const index &ix, const char *sequence, const segment *segm
     size_t next = 0, active = slots.size();
     int score = 0;
     uint64_t found = 0, steps = 0, kmers = 0, searches = 0, rechecks = 0;
+    // With both strands indexed, the windows are searched as they are only.
+    const bool one_strand = ix.strands == 2;
 
     // Character of the strand at position v, and the result of its window y.
     auto symbol = [&](const slot &s, int v) -> byte {
@@ -968,7 +1032,7 @@ void lookup_streaming(const index &ix, const char *sequence, const segment *segm
         }
     };
     strand_done = [&](slot &s) {
-        if (!s.second) {
+        if (!s.second && !one_strand) {
             s.second = 1;
             s.reverse ^= 1;
             s.top_only_above = INT32_MAX;
@@ -993,7 +1057,7 @@ void lookup_streaming(const index &ix, const char *sequence, const segment *segm
         s.length = g.length;
         s.windows = g.length - k + 1;
         kmers += s.windows;
-        s.reverse = score < 0;
+        s.reverse = !one_strand && score < 0;
         s.second = 0;
         s.hits[0] = s.hits[1] = 0;
         s.top_only_above = INT32_MAX;
@@ -1142,8 +1206,10 @@ inline uint8_t first_symbol(const index &ix, size_t row) {
 /// the occurrence at the row of the suffix shortened by this c. Selecting it inverts update_range.
 inline size_t next_row_rank(const index &ix, size_t row, uint8_t c) {
     size_t r = row - ix.counts[c];
-    // The dollar is stored as A in the BWT without being an occurrence of A.
-    return r + (c == 0 && r >= ix.dollar_rank);
+    if (c != 0) return r;
+    // The sentinels are stored as A in the BWT without being occurrences of A.
+    r += r >= ix.dollar_rank;
+    return r + (r >= ix.dollar_rank2);
 }
 
 /// Access: the k-mer with the given hash, i.e., the k-mer at the set occurrence number [hash] (from 0)

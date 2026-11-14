@@ -3,6 +3,7 @@
 
 #include "fms_index.h"
 #include "fms_index2.h"
+#include "doubled.h"
 #include "query_pipeline.h"
 #include "memory_usage.h"
 #include "parser.h"
@@ -25,7 +26,7 @@ static int usage() {
   std::cerr << "Contact: Ondrej Sladky (ondra.sladky@gmail.com)" << std::endl << std::endl;
   std::cerr << "Usage:   fmsi2 <command> [options]" << std::endl << std::endl;
   std::cerr << "Commands:" << std::endl;
-  std::cerr << "    index   - Index a masked superstring: one file <name>.fmsi." << std::endl;
+  std::cerr << "    index   - Index a masked superstring: one file <name>.fmsi (presets --small and --fast)." << std::endl;
   std::cerr << "    query   - Membership queries: for every k-mer of the queries, whether it is in the set." << std::endl;
   std::cerr << "    lookup  - Dictionary queries: the hash of every k-mer of the queries (-1 if it is not in the set)." << std::endl;
   std::cerr << "    access  - Dictionary queries: the k-mer of every hash, the inverse of lookup." << std::endl;
@@ -406,6 +407,10 @@ static int usage_index2() {
   std::cerr << "Usage:   fmsi2 index [options] <masked-superstring>" << std::endl << std::endl;
   std::cerr << "Indexes a masked superstring (FASTA, lower case = masked out; e.g. from KmerCamel) for membership" << std::endl;
   std::cerr << "queries (fmsi2 query) and dictionary queries (fmsi2 lookup, fmsi2 access). The index is one file." << std::endl << std::endl;
+  std::cerr << "Presets:" << std::endl;
+  std::cerr << "    --small - [default] the masked superstring alone" << std::endl;
+  std::cerr << "    --fast  - speed first: the masked superstring and its reverse complement (twice the space), so that" << std::endl;
+  std::cerr << "              a k-mer is searched as it is only, never as its reverse complement" << std::endl << std::endl;
   std::cerr << "Options:" << std::endl;
   std::cerr << "    -o FILE - the index file [default: <masked-superstring>.fmsi]; .fmsi is added if missing" << std::endl;
   std::cerr << "    -k INT  - size of k-mers [default: number of trailing masked-out characters + 1]" << std::endl;
@@ -423,7 +428,7 @@ static int usage_index2() {
   std::cerr << "              max-one (every occurrence of a k-mer of the set is set), or auto: as the header of the masked" << std::endl;
   std::cerr << "              superstring states it (mask=min-one, as KmerCamel writes), else as computed [default: auto];" << std::endl;
   std::cerr << "              a stated type that the mask contradicts is replaced by the computed one, with a warning" << std::endl;
-  std::cerr << "    -Q      - construct the suffix array by QSufSort instead of libsais" << std::endl << std::endl;
+  std::cerr << "    -Q      - construct the suffix array by QSufSort instead of libsais (--small only)" << std::endl << std::endl;
   return 1;
 }
 
@@ -498,13 +503,27 @@ int ms_index2(int argc, char *argv[]) {
   int k = 0;
   bool use_qsufsort = false;
   std::string prefix;
-  // The layout in memory that the file recommends: the fastest one unless -c or -m is given.
+  // The layout in memory that the file recommends: that of the preset unless -c or -m is given.
   fmsi2::layout layout;
   std::string mask_type = "auto";
   bool use_klcp = false;
   int threads = 1;
-  while ((c = getopt(argc, argv, "hk:m:c:lo:Qt:M:")) >= 0) {
+  // Presets: --small (one strand) or --fast (both strands).
+  bool fast = false;
+  enum { OPTION_SMALL = 256, OPTION_FAST };
+  static const struct option long_options[] = {
+      {"small", no_argument, nullptr, OPTION_SMALL},
+      {"fast", no_argument, nullptr, OPTION_FAST},
+      {nullptr, 0, nullptr, 0},
+  };
+  while ((c = getopt_long(argc, argv, "hk:m:c:lo:Qt:M:", long_options, nullptr)) >= 0) {
     switch (c) {
+    case OPTION_SMALL:
+      fast = false;
+      break;
+    case OPTION_FAST:
+      fast = true;
+      break;
     case 'h':
       usage = true;
       break;
@@ -550,9 +569,14 @@ int ms_index2(int argc, char *argv[]) {
     return usage_index2();
   }
   const std::string index_path = index_file_name(prefix.empty() ? fn : prefix);
-  const fmsi2::layout default_layout = fmsi2::default_layout();
-  if (layout.bwt_block_bytes == 0) layout.bwt_block_bytes = default_layout.bwt_block_bytes;
-  if (layout.mask < 0) layout.mask = default_layout.mask;
+  const std::string preset = fast ? "fast" : "small";
+  const fmsi2::layout preset_layout = fmsi2::preset_layout(preset);
+  if (layout.bwt_block_bytes == 0) layout.bwt_block_bytes = preset_layout.bwt_block_bytes;
+  if (layout.mask < 0) layout.mask = preset_layout.mask;
+  if (fast && use_qsufsort) {
+    std::cerr << "ERROR: QSufSort (-Q) constructs the --small index only." << std::endl;
+    return usage_index2();
+  }
 
   build_phases = phase_timer();
   std::string header;
@@ -571,18 +595,23 @@ int ms_index2(int argc, char *argv[]) {
   size_t length = ms.size();
   // The rows that start with the same k-mer tell the type of the mask, or check the one that is stated.
   mbwt_with_same_kmer = true;
-  if (use_klcp && k > 65) {
-    std::cerr << "ERROR: The kLCP array (-l) is available for k <= 65." << std::endl;
+  if (use_klcp && !fast && k > 65) {
+    std::cerr << "ERROR: The kLCP array (-l) of the --small index is available for k <= 65." << std::endl;
     return 1;
   }
-  mbwt m = k <= 32 ? compute_mbwt<uint64_t>(ms, k, use_klcp, use_qsufsort, threads)
-                   : compute_mbwt<__uint128_t>(ms, k, use_klcp, use_qsufsort, threads);
-  std::cerr << "Constructed the masked Burrows-Wheeler transform" << std::endl;
+  mbwt m;
+  if (fast) {
+    m = doubled::compute_mbwt(std::move(ms), k, use_klcp, threads);
+  } else {
+    m = k <= 32 ? compute_mbwt<uint64_t>(ms, k, use_klcp, use_qsufsort, threads)
+                : compute_mbwt<__uint128_t>(ms, k, use_klcp, use_qsufsort, threads);
+  }
+  std::cerr << "Constructed the masked Burrows-Wheeler transform" << (fast ? " of both strands" : "") << std::endl;
   std::string().swap(ms);
   // The index is written from the MBWT; its layout in memory is built when it is loaded.
   const fmsi2::mask_statistics statistics = fmsi2::decide_mask_type(fmsi2::classify_mask(m), mask_type, header_field(header, "mask"));
   if (!statistics.warning.empty()) std::cerr << "WARNING: " << statistics.warning << "." << std::endl;
-  const fmsi2::description description = fmsi2::save_mbwt(m, k, layout, statistics, index_path, threads, header);
+  const fmsi2::description description = fmsi2::save_mbwt(m, k, preset, layout, statistics, index_path, threads, header);
   const double index_bytes = (double)std::filesystem::file_size(index_path);
   std::cerr << "Written " << index_path << ": " << (uint64_t)index_bytes << " bytes (" << 8 * index_bytes / length
             << " bits per character of the superstring), mask " << statistics.type << " (" << statistics.source << ")" << std::endl;
@@ -596,7 +625,8 @@ int ms_index2(int argc, char *argv[]) {
   build_phases.lap("write");
 
   double total = 0;
-  std::cerr << "[fmsi2-build]\tthreads=" << threads << "\topenmp=" << SUFFIX_ARRAY_THREADED;
+  std::cerr << "[fmsi2-build]\tpreset=" << preset << "\tstrands=" << description.strands
+            << "\tthreads=" << threads << "\topenmp=" << SUFFIX_ARRAY_THREADED;
   for (const auto &phase : build_phases.phases) {
     std::cerr << "\t" << phase.first << "_s=" << phase.second;
     total += phase.second;
@@ -730,7 +760,7 @@ int ms_query2(int argc, char *argv[], bool output_orders) {
             << "\tkmers=" << lookups.kmers << "\tfound=" << lookups.found
             << "\tsteps_per_kmer=" << (lookups.kmers ? (double)lookups.steps / lookups.kmers : 0)
             << "\tsearches=" << lookups.searches << "\trechecks=" << lookups.rechecks
-            << "\tklcp=" << index.has_klcp() << "\tthreads=" << threads
+            << "\tklcp=" << index.has_klcp() << "\tstrands=" << index.strands << "\tthreads=" << threads
             << "\tbwt_block_bytes=" << index.bwt.block_bytes() << "\tmask=" << fmsi2::mask_name(index.mask_type)
             << "\tindex_bytes_in_memory=" << index.bytes()
             << "\tloaded_rss_kb=" << loaded_bytes / 1000 << "\tload_peak_rss_kb=" << load_peak_bytes / 1000
@@ -1183,13 +1213,14 @@ int ms_info(int argc, char *argv[]) {
     std::cout << "bytes\t" << in.file_bytes() << std::endl;
     for (const auto &item : meta.items()) std::cout << item.first << "\t" << item.second << std::endl;
     if (meta.has("rows") && meta.get("kind") == "index") {
-      // The rows include the sentinel.
-      const double characters = (double)(meta.number("rows") - 1);
+      const double strands = (double)meta.number("strands", 1);
+      // The superstring has (rows - strands) / strands characters; the rows include the sentinels.
+      const double characters = (meta.number("rows") - strands) / strands;
       std::cout << "superstring_characters\t" << (uint64_t)characters << std::endl;
       std::cout << "bits_per_superstring_character\t" << 8.0 * in.file_bytes() / characters << std::endl;
       if (meta.get("mask_type").find("min-one") == 0) {
-        std::cout << "kmers\t" << meta.number("mask_ones") << std::endl;
-        std::cout << "bits_per_kmer\t" << 8.0 * in.file_bytes() / meta.number("mask_ones") << std::endl;
+        std::cout << "kmers\t" << meta.number("mask_ones") / (uint64_t)strands << std::endl;
+        std::cout << "bits_per_kmer\t" << 8.0 * in.file_bytes() * strands / meta.number("mask_ones") << std::endl;
       }
     }
     for (const auto &e : in.sections()) {
