@@ -428,6 +428,9 @@ static int usage_index2() {
   std::cerr << "              max-one (every occurrence of a k-mer of the set is set), or auto: as the header of the masked" << std::endl;
   std::cerr << "              superstring states it (mask=min-one, as KmerCamel writes), else as computed [default: auto];" << std::endl;
   std::cerr << "              a stated type that the mask contradicts is replaced by the computed one, with a warning" << std::endl;
+  std::cerr << "    --lean  - with --fast: merge the suffix arrays of the superstring and of its reverse complement instead" << std::endl;
+  std::cerr << "              of constructing that of both (less memory; superstrings below 2^31 characters; temporary" << std::endl;
+  std::cerr << "              files <index file>.tmp.sa_*); the index is the same" << std::endl;
   std::cerr << "    -Q      - construct the suffix array by QSufSort instead of libsais (--small only)" << std::endl << std::endl;
   return 1;
 }
@@ -509,11 +512,12 @@ int ms_index2(int argc, char *argv[]) {
   bool use_klcp = false;
   int threads = 1;
   // Presets: --small (one strand) or --fast (both strands).
-  bool fast = false;
-  enum { OPTION_SMALL = 256, OPTION_FAST };
+  bool fast = false, lean = false;
+  enum { OPTION_SMALL = 256, OPTION_FAST, OPTION_LEAN };
   static const struct option long_options[] = {
       {"small", no_argument, nullptr, OPTION_SMALL},
       {"fast", no_argument, nullptr, OPTION_FAST},
+      {"lean", no_argument, nullptr, OPTION_LEAN},
       {nullptr, 0, nullptr, 0},
   };
   while ((c = getopt_long(argc, argv, "hk:m:c:lo:Qt:M:", long_options, nullptr)) >= 0) {
@@ -523,6 +527,9 @@ int ms_index2(int argc, char *argv[]) {
       break;
     case OPTION_FAST:
       fast = true;
+      break;
+    case OPTION_LEAN:
+      lean = true;
       break;
     case 'h':
       usage = true;
@@ -577,6 +584,10 @@ int ms_index2(int argc, char *argv[]) {
     std::cerr << "ERROR: QSufSort (-Q) constructs the --small index only." << std::endl;
     return usage_index2();
   }
+  if (lean && !fast) {
+    std::cerr << "ERROR: The lean construction (--lean) is the one of the --fast index." << std::endl;
+    return usage_index2();
+  }
 
   build_phases = phase_timer();
   std::string header;
@@ -600,7 +611,9 @@ int ms_index2(int argc, char *argv[]) {
     return 1;
   }
   mbwt m;
-  if (fast) {
+  if (fast && lean) {
+    m = doubled::compute_mbwt_lean(std::move(ms), k, use_klcp, threads, index_path + ".tmp");
+  } else if (fast) {
     m = doubled::compute_mbwt(std::move(ms), k, use_klcp, threads);
   } else {
     m = k <= 32 ? compute_mbwt<uint64_t>(ms, k, use_klcp, use_qsufsort, threads)
@@ -625,7 +638,7 @@ int ms_index2(int argc, char *argv[]) {
   build_phases.lap("write");
 
   double total = 0;
-  std::cerr << "[fmsi2-build]\tpreset=" << preset << "\tstrands=" << description.strands
+  std::cerr << "[fmsi2-build]\tpreset=" << preset << "\tlean=" << lean << "\tstrands=" << description.strands
             << "\tthreads=" << threads << "\topenmp=" << SUFFIX_ARRAY_THREADED;
   for (const auto &phase : build_phases.phases) {
     std::cerr << "\t" << phase.first << "_s=" << phase.second;
