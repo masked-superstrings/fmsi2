@@ -459,7 +459,8 @@ static int usage_query2(bool lookup) {
   std::cerr << "  -m STR  - encoding of the mask in memory: plain (the fastest), packed (smaller) or rrr (slow)" << std::endl;
   std::cerr << "            [default: as the index file recommends]" << std::endl;
   std::cerr << "  -b INT  - number of k-mers (or sequences if -S) searched at the same time; 1 turns batching off [default: 32]" << std::endl;
-  std::cerr << "  -p INT  - length of the patterns with tabulated SA intervals; 0 turns the table off [default: 10]" << std::endl;
+  std::cerr << "  -p INT  - length of the patterns with tabulated SA intervals (8 * 4^INT bytes); 0 turns the table off" << std::endl;
+  std::cerr << "            [default: by the size and the layout of the index, at most 12]" << std::endl;
   std::cerr << "  -B INT  - size of a block of sequences handed to a thread, in bytes of the query file [default: 131072]" << std::endl;
   std::cerr << "  -O      - accepted and ignored (the option of FMSI 1 for max-one masks; any mask is tested in constant time)" << std::endl;
   std::cerr << "  -k INT  - size of k-mers, checked against the index" << std::endl;
@@ -675,7 +676,8 @@ int ms_query2(int argc, char *argv[], bool output_orders) {
 
   std::string query_fn = "-";
   int batch_size = 32;
-  int prefix_length = 10;
+  // -1: the default of the index (fmsi2::default_prefix_length).
+  int prefix_length = -1;
   bool streaming = false;
   bool use_klcp = true;
   int threads = 1;
@@ -728,7 +730,7 @@ int ms_query2(int argc, char *argv[], bool output_orders) {
   } else if (fn.empty()) {
     std::cerr << "ERROR: The index file is a required argument." << std::endl;
     return usage_query2(output_orders);
-  } else if (batch_size < 1 || threads < 1 || block_bases < 1 || prefix_length < 0 || prefix_length > 14) {
+  } else if (batch_size < 1 || threads < 1 || block_bases < 1 || prefix_length < -1 || prefix_length > 14) {
     std::cerr << "ERROR: The batch size, the block size and the number of threads must be positive and the table pattern length between 0 and 14." << std::endl;
     return usage_query2(output_orders);
   }
@@ -757,6 +759,7 @@ int ms_query2(int argc, char *argv[], bool output_orders) {
     fmsi2::load_klcp(index, index_path + fmsi2::KLCP_EXTENSION, threads);
   }
   double load_seconds = seconds_since_start();
+  if (prefix_length < 0) prefix_length = fmsi2::default_prefix_length(index);
   fmsi2::build_prefix_table(index, prefix_length);
   double table_seconds = seconds_since_start() - load_seconds;
   // Resident memory once the index is ready, and the peak of loading it.
@@ -778,6 +781,7 @@ int ms_query2(int argc, char *argv[], bool output_orders) {
             << "\tindex_bytes_in_memory=" << index.bytes()
             << "\tloaded_rss_kb=" << loaded_bytes / 1000 << "\tload_peak_rss_kb=" << load_peak_bytes / 1000
             << "\tend_rss_kb=" << fmsi2::resident_bytes() / 1000 << "\tpeak_rss_kb=" << fmsi2::peak_resident_bytes() / 1000
+            << "\ttable_length=" << index.prefix_length << "\ttable_bytes=" << index.prefix_table_bytes()
             << "\tload_s=" << load_seconds << "\ttable_s=" << table_seconds
             << "\tread_s=" << stats.read << "\tparse_s=" << stats.parse / threads
             << "\tscan_s=" << stats.scan / threads
