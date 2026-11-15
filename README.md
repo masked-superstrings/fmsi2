@@ -201,6 +201,13 @@ does not know unless they are marked as required, so later versions can add data
 exist. The rank structures, the table of the first search steps and the hints of select are not stored: they are
 built when the file is loaded, in the layout asked for, which takes about a second per 500 million characters.
 
+`fmsi2 index --compact-file` (`-z`) stores the mask along the superstring instead of in the order of the suffix
+array. There it is a few long runs (the *k*-mers of a simplitig are set, those spanning the junction to the next one
+are not), so it takes 0.02–0.35 bits per character instead of 0.2–0.9: the file gets 10–25% smaller. The index is the
+same once loaded: the mask is permuted into the order of the suffix array by walks over the BWT, which takes about
+10 ns per character on one thread instead of 2 (`fmsi2 query -t` loads on several threads). Use it where the size of
+the file matters more than the time of loading it.
+
 Indexes of FMSI 1 (several files `<prefix>.fmsi.*`) are read by `fmsi2 legacy` only; index the masked superstring
 again.
 
@@ -208,10 +215,11 @@ again.
 
 | command | |
 |---|---|
-| `fmsi2 index [--extra-small\|--small\|--fast] [-l] [-t INT] [-o FILE] <masked superstring>` | index a masked superstring |
+| `fmsi2 index [--extra-small\|--small\|--fast] [-l] [-z] [-t INT] [-o FILE] <masked superstring>` | index a masked superstring |
 | `fmsi2 query [-S] [-t INT] -q <queries> <index.fmsi>` | membership queries |
 | `fmsi2 lookup [-S] [-t INT] -q <queries> <index.fmsi>` | dictionary queries: hashes of *k*-mers |
 | `fmsi2 access -q <hashes> <index.fmsi>` | dictionary queries: *k*-mers of hashes |
+| `fmsi2 export <index.fmsi>` | print the masked superstring of an index |
 | `fmsi2 info [--check] <index.fmsi>` | what an index file holds |
 | `fmsi2 legacy <command>` | the commands of FMSI 1 |
 
