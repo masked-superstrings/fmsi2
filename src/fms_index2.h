@@ -401,12 +401,15 @@ struct layout {
     int mask = -1;
 };
 
-/// The layout of the presets: --small and --fast answer the fastest (blocks of 64 bytes, i.e. one cache line per
-/// rank, and the plain mask); --small indexes the superstring, --fast also its reverse complement.
+/// The layouts of the presets. --extra-small takes the least memory: blocks of 256 bytes and the Tunstall-coded
+/// mask (2.07 + 0.3 to 0.9 bits per character of the superstring). --small and --fast answer the fastest: blocks
+/// of 64 bytes, i.e. one cache line per rank, and the plain mask (2.29 + 1.03 bits per character); --small
+/// indexes the superstring, --fast also its reverse complement.
 inline layout preset_layout(const std::string &preset) {
     layout result;
-    result.bwt_block_bytes = 64;
-    result.mask = (int)mask_kind::plain;
+    const bool compact = preset == "extra-small";
+    result.bwt_block_bytes = compact ? 256 : 64;
+    result.mask = (int)(compact ? mask_kind::packed : mask_kind::plain);
     return result;
 }
 
