@@ -59,7 +59,7 @@ The methods are described in:
 *Bioinformatics Advances* 6(1):vbaf290, 2026; [doi: 10.1093/bioadv/vbaf290](https://doi.org/10.1093/bioadv/vbaf290).
 
 [2] Ondřej Sladký, Pavel Veselý, and Karel Břinda: Towards Efficient *k*-Mer Set Operations via Function-Assigned Masked Superstrings.
-*bioRxiv* 2024.03.06.583483, 2024. [https://doi.org/10.1101/2024.03.06.583483](https://doi.org/10.1101/2024.03.06.583483)
+*Proceedings of the Prague Stringology Conference (PSC)*, pp. 26–40, 2025; [paper](https://www.stringology.org/event/2025/p04.html), [preprint](https://doi.org/10.1101/2024.03.06.583483).
 
 [3] Ondřej Sladký, Pavel Veselý, and Karel Břinda: Masked superstrings as a unified framework for textual *k*-mer set representations. *bioRxiv* 2023.02.01.526717, 2023.
 [https://doi.org/10.1101/2023.02.01.526717](https://doi.org/10.1101/2023.02.01.526717)
