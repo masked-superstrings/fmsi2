@@ -38,11 +38,11 @@
 
 FMSI 2 is a memory-efficient index of *k*-mer sets. It represents a set by a
 [masked superstring](https://doi.org/10.1101/2023.02.01.526717) (a superstring of the *k*-mers with a mask that tells
-which of its *k*-mers are in the set, computed e.g. by [KmerCamel🐫](https://github.com/OndrejSladky/kmercamel)) and
+which of its *k*-mers are in the set, computed e.g. by [KmerCamel🐫](https://github.com/masked-superstrings/kmercamel)) and
 indexes it by its masked Burrows–Wheeler transform, an FM-index without a sampled suffix array. Masked superstrings
 stay compact for any *k*-mer set, also for subsampled sets and sequencing data, whose de Bruijn graphs are fragmented.
 
-**FMSI 2** is the successor of [FMSI](https://github.com/OndrejSladky/fmsi) (FMSI 1): it keeps the index and replaces
+**FMSI 2** is the successor of [FMSI](https://github.com/masked-superstrings/fmsi) (FMSI 1): it keeps the index and replaces
 the engine (see [FMSI 2 vs. FMSI 1](#fmsi-2-vs-fmsi-1)), and answers the queries of FMSI 1 with the same results, one to
 two orders of magnitude faster:
 
@@ -264,7 +264,7 @@ experimental *k*-mer set operations `union`, `inter`, `diff`, `symdiff`, `merge`
 (`-O`, `-f`) and their index of several files (`<prefix>.fmsi.*`). They are kept for comparisons and for the set
 operations in the framework of [function-assigned masked superstrings](https://doi.org/10.1101/2024.03.06.583483),
 which are supported only through `fmsi2 legacy`; they are documented in the
-[repository of FMSI 1](https://github.com/OndrejSladky/fmsi#k-mer-set-operations-experimental).
+[repository of FMSI 1](https://github.com/masked-superstrings/fmsi#k-mer-set-operations-experimental).
 
 ## Performance
 
@@ -355,7 +355,7 @@ Please use [GitHub issues](https://github.com/masked-superstrings/fmsi2/issues).
 
 ### Changelog
 
-FMSI 2 is not released yet. For FMSI 1, see its [releases](https://github.com/OndrejSladky/fmsi/releases).
+FMSI 2 is not released yet. For FMSI 1, see its [releases](https://github.com/masked-superstrings/fmsi/releases).
 
 ## About
 
